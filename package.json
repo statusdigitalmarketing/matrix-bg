@@ -1,0 +1,20 @@
+{
+  "name": "matrix-bg-screensaver",
+  "version": "1.0.0",
+  "description": "Matrix rain desktop overlay and screensaver for macOS",
+  "bin": {
+    "matrix-bg-install": "./install.sh"
+  },
+  "scripts": {
+    "postinstall": "if [ \"$(uname)\" = \"Darwin\" ]; then bash ./install.sh; else echo 'matrix-bg only works on macOS'; fi"
+  },
+  "os": ["darwin"],
+  "keywords": ["matrix", "screensaver", "macos", "terminal", "desktop", "rain"],
+  "author": "Status Digital Marketing",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/statusdigitalmarketing/matrix-bg.git"
+  },
+  "homepage": "https://github.com/statusdigitalmarketing/matrix-bg#readme"
+}
