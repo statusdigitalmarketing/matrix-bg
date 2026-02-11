@@ -25,14 +25,16 @@ if [[ -f "$PLIST_PATH" ]]; then
 fi
 
 # Remove files
-for f in "$INSTALL_DIR/matrix-bg" "$WATCHER_PATH"; do
+for f in "$INSTALL_DIR/matrix-bg" "$INSTALL_DIR/matrix-bg-bin" "$WATCHER_PATH"; do
     if [[ -f "$f" ]]; then
         rm -f "$f"
         echo "  Removed $f"
     fi
 done
 
-# Clean up log
+# Clean up temp files
 rm -f /tmp/matrix-bg-watcher.log
+rm -f /tmp/.matrix-bg-wallpaper-backup
+rm -f /tmp/.matrix-idle-pid
 
 echo -e "${GREEN}matrix-bg uninstalled.${NC}"

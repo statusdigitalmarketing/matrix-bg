@@ -167,6 +167,9 @@ final class MatrixView: NSView {
 let wallpaperBackupPath = "/tmp/.matrix-bg-wallpaper-backup"
 
 func saveCurrentWallpaper() {
+    // Don't overwrite an existing backup — another matrix-bg instance may already be running
+    // and the current desktop could already be our black overlay.
+    guard !FileManager.default.fileExists(atPath: wallpaperBackupPath) else { return }
     guard let mainScreen = NSScreen.main,
           let url = NSWorkspace.shared.desktopImageURL(for: mainScreen) else { return }
     try? url.path.write(toFile: wallpaperBackupPath, atomically: true, encoding: .utf8)
@@ -175,7 +178,7 @@ func saveCurrentWallpaper() {
 func restoreWallpaper() {
     guard FileManager.default.fileExists(atPath: wallpaperBackupPath),
           let path = try? String(contentsOfFile: wallpaperBackupPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
-          !path.isEmpty else { return }
+          FileManager.default.fileExists(atPath: path) else { return }
     let url = URL(fileURLWithPath: path)
     for screen in NSScreen.screens {
         try? NSWorkspace.shared.setDesktopImageURL(url, for: screen, options: [:])
@@ -220,8 +223,12 @@ for screen in NSScreen.screens {
     windows.append(w)
 }
 
-// Clean shutdown: restore wallpaper, hide windows, then exit
+// Clean shutdown: restore wallpaper, hide windows, then exit.
+// Guard prevents double-call from concurrent signal + timer + event monitor.
+var isShuttingDown = false
 func shutdown() {
+    guard !isShuttingDown else { return }
+    isShuttingDown = true
     restoreWallpaper()
     for w in windows { w.orderOut(nil) }
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
