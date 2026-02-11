@@ -1,0 +1,14 @@
+# Compiled binary
+matrix-bg
+*.o
+*.d
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Temp files
+/tmp/

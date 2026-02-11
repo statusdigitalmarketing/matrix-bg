@@ -37,6 +37,7 @@ final class MatrixView: NSView {
     }()
 
     override var isOpaque: Bool { true }
+    override var acceptsFirstResponder: Bool { true }
 
     func start() {
         numCols = Int(bounds.width / cellW)
@@ -162,11 +163,35 @@ final class MatrixView: NSView {
     }
 }
 
+// MARK: - Wallpaper Save / Restore
+let wallpaperBackupPath = "/tmp/.matrix-bg-wallpaper-backup"
+
+func saveCurrentWallpaper() {
+    guard let mainScreen = NSScreen.main,
+          let url = NSWorkspace.shared.desktopImageURL(for: mainScreen) else { return }
+    try? url.path.write(toFile: wallpaperBackupPath, atomically: true, encoding: .utf8)
+}
+
+func restoreWallpaper() {
+    guard FileManager.default.fileExists(atPath: wallpaperBackupPath),
+          let path = try? String(contentsOfFile: wallpaperBackupPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+          !path.isEmpty else { return }
+    let url = URL(fileURLWithPath: path)
+    for screen in NSScreen.screens {
+        try? NSWorkspace.shared.setDesktopImageURL(url, for: screen, options: [:])
+    }
+    try? FileManager.default.removeItem(atPath: wallpaperBackupPath)
+}
+
 // MARK: - App Setup
 let fullscreen = CommandLine.arguments.contains("--fullscreen")
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
+
+// Save wallpaper before we put black windows over the desktop
+saveCurrentWallpaper()
+atexit { restoreWallpaper() }
 
 let windowLevel: NSWindow.Level = fullscreen
     ? .screenSaver
@@ -194,13 +219,73 @@ for screen in NSScreen.screens {
     windows.append(w)
 }
 
+// Clean shutdown: restore wallpaper, hide windows, then exit
+func shutdown() {
+    restoreWallpaper()
+    for w in windows { w.orderOut(nil) }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+        NSApp.terminate(nil)
+    }
+}
+
+// In fullscreen mode, dismiss on mouse movement or keypress
+if fullscreen {
+    // Force-activate so our windows actually receive input events
+    app.activate(ignoringOtherApps: true)
+    for w in windows {
+        w.acceptsMouseMovedEvents = true
+        w.makeFirstResponder(w.contentView)
+    }
+
+    var origin = NSEvent.mouseLocation
+    var armed = false
+
+    // Wait 0.5s before arming — avoids instant dismiss from residual input
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+        origin = NSEvent.mouseLocation
+        armed = true
+    }
+
+    // Local monitor — catches events delivered to OUR windows (primary)
+    NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .keyDown, .leftMouseDown, .rightMouseDown, .scrollWheel]) { event in
+        guard armed else { return event }
+        if event.type == .mouseMoved {
+            let cur = NSEvent.mouseLocation
+            let dx = cur.x - origin.x
+            let dy = cur.y - origin.y
+            if dx * dx + dy * dy > 25 { shutdown() }
+        } else {
+            shutdown()
+        }
+        return event
+    }
+
+    // Global monitor as fallback — catches events going to other apps
+    NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .keyDown, .leftMouseDown, .rightMouseDown, .scrollWheel]) { event in
+        guard armed else { return }
+        if event.type == .mouseMoved {
+            let cur = NSEvent.mouseLocation
+            let dx = cur.x - origin.x
+            let dy = cur.y - origin.y
+            if dx * dx + dy * dy > 25 { shutdown() }
+        } else {
+            shutdown()
+        }
+    }
+}
+
 var signalSources: [DispatchSourceSignal] = []
 for sig: Int32 in [SIGTERM, SIGINT] {
     signal(sig, SIG_IGN)
     let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
-    src.setEventHandler { NSApp.terminate(nil) }
+    src.setEventHandler { shutdown() }
     src.resume()
     signalSources.append(src)
+}
+
+// Auto-kill after 60s — prevents glitchy runaway processes
+DispatchQueue.main.asyncAfter(deadline: .now() + 60) {
+    shutdown()
 }
 
 app.run()
