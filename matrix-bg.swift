@@ -214,7 +214,8 @@ for screen in NSScreen.screens {
 
     let view = MatrixView(frame: screen.frame)
     w.contentView = view
-    w.makeKeyAndOrderFront(nil)
+    // orderFront without makeKey — shows the window without stealing focus
+    w.orderFront(nil)
     view.start()
     windows.append(w)
 }
@@ -228,15 +229,9 @@ func shutdown() {
     }
 }
 
-// In fullscreen mode, dismiss on mouse movement or keypress
+// In fullscreen mode, dismiss on mouse movement or keypress.
+// Uses ONLY the global event monitor — never steals focus from the active app.
 if fullscreen {
-    // Force-activate so our windows actually receive input events
-    app.activate(ignoringOtherApps: true)
-    for w in windows {
-        w.acceptsMouseMovedEvents = true
-        w.makeFirstResponder(w.contentView)
-    }
-
     var origin = NSEvent.mouseLocation
     var armed = false
 
@@ -246,21 +241,8 @@ if fullscreen {
         armed = true
     }
 
-    // Local monitor — catches events delivered to OUR windows (primary)
-    NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .keyDown, .leftMouseDown, .rightMouseDown, .scrollWheel]) { event in
-        guard armed else { return event }
-        if event.type == .mouseMoved {
-            let cur = NSEvent.mouseLocation
-            let dx = cur.x - origin.x
-            let dy = cur.y - origin.y
-            if dx * dx + dy * dy > 25 { shutdown() }
-        } else {
-            shutdown()
-        }
-        return event
-    }
-
-    // Global monitor as fallback — catches events going to other apps
+    // Global monitor — passively watches events going to other apps without
+    // intercepting them. The active app keeps focus and receives all input normally.
     NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .keyDown, .leftMouseDown, .rightMouseDown, .scrollWheel]) { event in
         guard armed else { return }
         if event.type == .mouseMoved {
