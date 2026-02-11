@@ -36,7 +36,7 @@ final class MatrixView: NSView {
         return c
     }()
 
-    override var isOpaque: Bool { true }
+    override var isOpaque: Bool { false }
     override var acceptsFirstResponder: Bool { true }
 
     func start() {
@@ -73,8 +73,9 @@ final class MatrixView: NSView {
         wantsLayer = true
         layer?.drawsAsynchronously = true
         layer?.isOpaque = true
+        layer?.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
 
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 20.0, repeats: true) { [weak self] _ in
             self?.tick()
         }
     }
@@ -124,9 +125,9 @@ final class MatrixView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
 
-        // Black background
-        ctx.setFillColor(red: 0, green: 0, blue: 0, alpha: 1)
-        ctx.fill(bounds)
+        // Clear to transparent — the layer's black backgroundColor shows through.
+        // Faster than a manual fill because Core Animation composites on the GPU.
+        ctx.clear(bounds)
 
         let cw = cellW
         let ch = cellH
