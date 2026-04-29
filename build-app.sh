@@ -10,6 +10,7 @@ RES_DIR="$APP_DIR/Contents/Resources"
 
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
+RED='\033[0;31m'
 NC='\033[0m'
 
 echo -e "${CYAN}Building $APP_NAME.app...${NC}"
@@ -81,13 +82,14 @@ DEFAULT_SIGN_ID="Developer ID Application: Status Consulting Firm LLC (Z349CC556
 SIGN_ID="${SIGN_ID:-$DEFAULT_SIGN_ID}"
 
 if [[ "$SIGN_ID" == "-" ]]; then
-    echo -e "${CYAN}Ad-hoc signing...${NC}"
+    echo -e "${CYAN}Ad-hoc signing (dev build, not for distribution)...${NC}"
     codesign --force --deep --sign - "$APP_DIR"
 else
     if ! security find-identity -v -p codesigning | grep -q "$SIGN_ID"; then
-        echo "Signing identity not found: $SIGN_ID"
-        echo "Falling back to ad-hoc."
-        codesign --force --deep --sign - "$APP_DIR"
+        echo -e "${RED}Error:${NC} signing identity not found: $SIGN_ID" >&2
+        echo "Run with SIGN_ID=- ./build-app.sh for an unsigned dev build," >&2
+        echo "or install the Developer ID certificate and try again." >&2
+        exit 1
     else
         echo -e "${CYAN}Signing with Developer ID + hardened runtime...${NC}"
         # Sign the inner Mach-O binary first (deepest first)

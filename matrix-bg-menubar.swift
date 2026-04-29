@@ -3,10 +3,9 @@ import ServiceManagement
 import Foundation
 
 // MARK: - Config (UserDefaults)
-let kEnabled        = "screensaverEnabled"
-let kIdleSeconds    = "idleSeconds"
-let kSkipMedia      = "skipMedia"
-let kLaunchAtLogin  = "launchAtLogin"
+let kEnabled     = "screensaverEnabled"
+let kIdleSeconds = "idleSeconds"
+let kSkipMedia   = "skipMedia"
 
 func defaults() -> UserDefaults { UserDefaults.standard }
 
@@ -32,7 +31,6 @@ func bundleBinaryURL() -> URL {
 }
 
 func systemIdleSeconds() -> Int {
-    // ioreg -c IOHIDSystem -> HIDIdleTime in nanoseconds
     let task = Process()
     task.launchPath = "/usr/sbin/ioreg"
     task.arguments = ["-c", "IOHIDSystem"]
@@ -63,7 +61,6 @@ func mediaIsPlaying() -> Bool {
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     task.waitUntilExit()
     guard let s = String(data: data, encoding: .utf8) else { return false }
-    // Check active assertions used by video/audio playback
     for line in s.split(separator: "\n") {
         if line.contains("PreventUserIdleDisplaySleep") && line.contains("1") { return true }
         if line.contains("NoIdleSleepAssertion") && line.contains("Playing") { return true }
@@ -71,47 +68,81 @@ func mediaIsPlaying() -> Bool {
     return false
 }
 
+// One-shot cleanup: legacy bash watcher predates the menu bar app and would
+// race with our Swift idle timer. Unload + remove on first launch.
+func unloadLegacyWatcher() {
+    let plist = (NSHomeDirectory() as NSString)
+        .appendingPathComponent("Library/LaunchAgents/com.matrix-bg.idle-watcher.plist")
+    guard FileManager.default.fileExists(atPath: plist) else { return }
+    let task = Process()
+    task.launchPath = "/bin/launchctl"
+    task.arguments = ["unload", plist]
+    task.standardOutput = Pipe()
+    task.standardError = Pipe()
+    try? task.run()
+    task.waitUntilExit()
+    try? FileManager.default.removeItem(atPath: plist)
+}
+
 // MARK: - Rain Process Manager
+// All mutation of `process` flows through `queue` so menu actions on the main
+// thread and the idle-watcher background block can't race.
 
 final class RainController {
+    private let queue = DispatchQueue(label: "matrix-bg.rain")
     private var process: Process?
-    private(set) var mode: String? // "wallpaper" | "fullscreen" | nil
+    private var _mode: String?
+
+    var mode: String? { queue.sync { _mode } }
 
     func isRunning() -> Bool {
-        if let p = process, p.isRunning { return true }
-        process = nil
-        mode = nil
-        return false
+        queue.sync {
+            if let p = process, p.isRunning { return true }
+            process = nil
+            _mode = nil
+            return false
+        }
     }
 
     func start(fullscreen: Bool) {
-        stop()
-        let bin = bundleBinaryURL()
-        guard FileManager.default.isExecutableFile(atPath: bin.path) else {
-            NSLog("matrix-bg-bin not found at \(bin.path)")
-            return
-        }
-        let p = Process()
-        p.executableURL = bin
-        p.arguments = fullscreen ? ["--fullscreen"] : []
-        p.standardOutput = Pipe()
-        p.standardError = Pipe()
-        do {
-            try p.run()
-            process = p
-            mode = fullscreen ? "fullscreen" : "wallpaper"
-        } catch {
-            NSLog("Failed to launch matrix-bg-bin: \(error)")
+        queue.sync {
+            // Inline stop so we don't recursively grab the queue
+            if let p = process, p.isRunning {
+                p.terminate()
+                p.waitUntilExit()
+            }
+            process = nil
+            _mode = nil
+
+            let bin = bundleBinaryURL()
+            guard FileManager.default.isExecutableFile(atPath: bin.path) else {
+                NSLog("matrix-bg-bin not found at \(bin.path)")
+                return
+            }
+            let p = Process()
+            p.executableURL = bin
+            p.arguments = fullscreen ? ["--fullscreen"] : []
+            p.standardOutput = Pipe()
+            p.standardError = Pipe()
+            do {
+                try p.run()
+                process = p
+                _mode = fullscreen ? "fullscreen" : "wallpaper"
+            } catch {
+                NSLog("Failed to launch matrix-bg-bin: \(error)")
+            }
         }
     }
 
     func stop() {
-        if let p = process, p.isRunning {
-            p.terminate()
-            p.waitUntilExit()
+        queue.sync {
+            if let p = process, p.isRunning {
+                p.terminate()
+                p.waitUntilExit()
+            }
+            process = nil
+            _mode = nil
         }
-        process = nil
-        mode = nil
     }
 }
 
@@ -121,9 +152,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
     let rain = RainController()
     var idleTimer: Timer?
+    // Prevents idleTick from spawning a new background watcher on every fire
+    var watchingForActivity = false
 
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        unloadLegacyWatcher()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
@@ -139,7 +173,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         startIdleTimer()
     }
 
-    // Rebuild on every open so checkmarks/labels reflect current state
     func menuWillOpen(_ menu: NSMenu) {
         let fresh = buildMenu()
         fresh.delegate = self
@@ -147,6 +180,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ note: Notification) {
+        idleTimer?.invalidate()
+        idleTimer = nil
         rain.stop()
     }
 
@@ -155,7 +190,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func buildMenu() -> NSMenu {
         let menu = NSMenu()
 
-        // Run / Stop
         let running = rain.isRunning()
         let runWallpaper = NSMenuItem(title: running && rain.mode == "wallpaper" ? "Stop Wallpaper" : "Run as Wallpaper",
                                       action: #selector(toggleWallpaper), keyEquivalent: "")
@@ -175,7 +209,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        // Idle screensaver toggle
         let enabled = getBool(kEnabled, true)
         let toggle = NSMenuItem(title: "Idle Screensaver",
                                 action: #selector(toggleEnabled), keyEquivalent: "")
@@ -183,7 +216,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         toggle.state = enabled ? .on : .off
         menu.addItem(toggle)
 
-        // Idle timeout submenu
         let timeoutItem = NSMenuItem(title: "Idle Timeout: \(getInt(kIdleSeconds, 60))s", action: nil, keyEquivalent: "")
         let timeoutSub = NSMenu()
         let cur = getInt(kIdleSeconds, 60)
@@ -197,7 +229,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         timeoutItem.submenu = timeoutSub
         menu.addItem(timeoutItem)
 
-        // Skip during video
         let skip = NSMenuItem(title: "Pause During Video Playback",
                               action: #selector(toggleSkipMedia), keyEquivalent: "")
         skip.target = self
@@ -206,7 +237,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        // Launch at login
         let launch = NSMenuItem(title: "Launch at Login",
                                 action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
         launch.target = self
@@ -278,7 +308,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             • Click "Run Fullscreen Now" to preview
             • Move mouse or press a key to dismiss fullscreen rain
 
-            github.com/<your-repo>/matrix-bg
+            github.com/statusdigitalmarketing/matrix-bg
             """
         alert.alertStyle = .informational
         NSApp.activate(ignoringOtherApps: true)
@@ -304,23 +334,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let threshold = getInt(kIdleSeconds, 60)
         let idle = systemIdleSeconds()
 
-        if rain.isRunning() && rain.mode == "fullscreen" {
-            // Already running fullscreen — let the rain process self-dismiss on input
-            return
-        }
+        if rain.isRunning() && rain.mode == "fullscreen" { return }
 
-        if idle >= threshold {
+        if idle >= threshold && !watchingForActivity {
+            watchingForActivity = true
             rain.start(fullscreen: true)
-            // Watch for activity to stop ours (the rain process also dismisses itself
-            // on movement, but we keep this as a safety net)
+            // Background watcher: dismiss our rain when the user wakes the system.
+            // The flag prevents stacking watchers on subsequent idle ticks.
             DispatchQueue.global(qos: .background).async { [weak self] in
                 while self?.rain.isRunning() == true {
                     Thread.sleep(forTimeInterval: 0.5)
                     if systemIdleSeconds() < 3 {
-                        DispatchQueue.main.async { self?.rain.stop() }
-                        break
+                        DispatchQueue.main.async {
+                            self?.rain.stop()
+                            self?.watchingForActivity = false
+                        }
+                        return
                     }
                 }
+                DispatchQueue.main.async { self?.watchingForActivity = false }
             }
         }
     }
@@ -328,60 +360,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Launch at Login (SMAppService, macOS 13+)
 
     func launchAtLoginEnabled() -> Bool {
-        if #available(macOS 13.0, *) {
-            return SMAppService.mainApp.status == .enabled
-        }
-        return getBool(kLaunchAtLogin, false)
+        SMAppService.mainApp.status == .enabled
     }
 
     func setLaunchAtLogin(_ enabled: Bool) {
-        if #available(macOS 13.0, *) {
-            do {
-                if enabled {
-                    try SMAppService.mainApp.register()
-                } else {
-                    try SMAppService.mainApp.unregister()
-                }
-                defaults().set(enabled, forKey: kLaunchAtLogin)
-            } catch {
-                NSLog("SMAppService error: \(error)")
-                let alert = NSAlert()
-                alert.messageText = "Couldn't update Login Items"
-                alert.informativeText = "\(error.localizedDescription)\n\nYou can manage this manually in System Settings → General → Login Items."
-                alert.runModal()
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
             }
+        } catch {
+            NSLog("SMAppService error: \(error)")
+            let alert = NSAlert()
+            alert.messageText = "Couldn't update Login Items"
+            alert.informativeText = "\(error.localizedDescription)\n\nYou can manage this manually in System Settings → General → Login Items."
+            alert.runModal()
         }
     }
 }
 
 // MARK: - Main
 
-// CLI flags for headless register/unregister of Launch at Login.
-// Useful for installers and the .command file.
 let args = CommandLine.arguments
 if args.contains("--register-login") {
-    if #available(macOS 13.0, *) {
-        do { try SMAppService.mainApp.register(); print("registered") }
-        catch { print("error: \(error)"); exit(1) }
-    }
+    do { try SMAppService.mainApp.register(); print("registered") }
+    catch { print("error: \(error)"); exit(1) }
     exit(0)
 }
 if args.contains("--unregister-login") {
-    if #available(macOS 13.0, *) {
-        do { try SMAppService.mainApp.unregister(); print("unregistered") }
-        catch { print("error: \(error)"); exit(1) }
-    }
+    do { try SMAppService.mainApp.unregister(); print("unregistered") }
+    catch { print("error: \(error)"); exit(1) }
     exit(0)
 }
 if args.contains("--login-status") {
-    if #available(macOS 13.0, *) {
-        switch SMAppService.mainApp.status {
-        case .enabled: print("enabled")
-        case .requiresApproval: print("requiresApproval")
-        case .notRegistered: print("notRegistered")
-        case .notFound: print("notFound")
-        @unknown default: print("unknown")
-        }
+    switch SMAppService.mainApp.status {
+    case .enabled: print("enabled")
+    case .requiresApproval: print("requiresApproval")
+    case .notRegistered: print("notRegistered")
+    case .notFound: print("notFound")
+    @unknown default: print("unknown")
     }
     exit(0)
 }
