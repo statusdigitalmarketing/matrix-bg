@@ -37,7 +37,7 @@ final class MatrixView: NSView {
     }()
 
     override var isOpaque: Bool { false }
-    override var acceptsFirstResponder: Bool { true }
+    override var acceptsFirstResponder: Bool { false }
 
     func start() {
         numCols = Int(bounds.width / cellW)
@@ -164,6 +164,12 @@ final class MatrixView: NSView {
     }
 }
 
+// MARK: - Non-activating window (never steals focus)
+final class NonKeyWindow: NSWindow {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
 // MARK: - Wallpaper Save / Restore
 let wallpaperBackupPath = "/tmp/.matrix-bg-wallpaper-backup"
 
@@ -203,7 +209,7 @@ let windowLevel: NSWindow.Level = fullscreen
 
 var windows: [NSWindow] = []
 for screen in NSScreen.screens {
-    let w = NSWindow(
+    let w = NonKeyWindow(
         contentRect: screen.frame,
         styleMask: [.borderless],
         backing: .buffered,
@@ -214,7 +220,8 @@ for screen in NSScreen.screens {
     w.backgroundColor = .black
     w.isOpaque = true
     w.hasShadow = false
-    w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+    w.ignoresMouseEvents = true
+    w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
 
     let view = MatrixView(frame: screen.frame)
     w.contentView = view
