@@ -25,16 +25,22 @@ fi
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR" "$RES_DIR"
 
-# Compile menu bar app — main executable
-swiftc -O \
-    -o "$MACOS_DIR/$APP_NAME" \
-    "$SOURCE_DIR/matrix-bg-menubar.swift" \
+# Compile universal binaries (arm64 + x86_64) so the app runs on both
+# Apple Silicon and Intel Macs.
+build_universal() {
+    local out="$1" src="$2"; shift 2
+    local frameworks=("$@")
+    local tmp_arm64="$out.arm64.tmp" tmp_x86="$out.x86_64.tmp"
+    swiftc -O -target arm64-apple-macos13  -o "$tmp_arm64" "$src" "${frameworks[@]}"
+    swiftc -O -target x86_64-apple-macos13 -o "$tmp_x86"   "$src" "${frameworks[@]}"
+    lipo -create "$tmp_arm64" "$tmp_x86" -output "$out"
+    rm -f "$tmp_arm64" "$tmp_x86"
+}
+
+build_universal "$MACOS_DIR/$APP_NAME" "$SOURCE_DIR/matrix-bg-menubar.swift" \
     -framework AppKit -framework ServiceManagement
 
-# Compile rain renderer — co-located so menu bar app finds it
-swiftc -O \
-    -o "$MACOS_DIR/matrix-bg-bin" \
-    "$SOURCE_DIR/matrix-bg.swift" \
+build_universal "$MACOS_DIR/matrix-bg-bin" "$SOURCE_DIR/matrix-bg.swift" \
     -framework AppKit -framework CoreText
 
 # Copy app icon if present
