@@ -12,6 +12,7 @@ Native macOS Matrix rain desktop overlay. Single-file Swift, zero dependencies b
 - Wallpaper auto-save/restore — your desktop background always comes back
 - 60-second auto-kill safety net
 - Optional idle screensaver via launch agent
+- **Keep Awake** menu bar toggle that stops the Mac sleeping or locking, no permissions needed
 - 30fps, hardware-accelerated CoreText rendering
 
 ## Install

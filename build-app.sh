@@ -38,7 +38,7 @@ build_universal() {
 }
 
 build_universal "$MACOS_DIR/$APP_NAME" "$SOURCE_DIR/matrix-bg-menubar.swift" \
-    -framework AppKit -framework ServiceManagement
+    -framework AppKit -framework ServiceManagement -framework IOKit
 
 build_universal "$MACOS_DIR/matrix-bg-bin" "$SOURCE_DIR/matrix-bg.swift" \
     -framework AppKit -framework CoreText
@@ -61,9 +61,9 @@ cat > "$APP_DIR/Contents/Info.plist" << 'PLIST'
     <key>CFBundleIdentifier</key>
     <string>com.matrix-bg.app</string>
     <key>CFBundleVersion</key>
-    <string>1.0</string>
+    <string>1.1</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>1.1</string>
     <key>CFBundleExecutable</key>
     <string>MatrixBG</string>
     <key>CFBundlePackageType</key>

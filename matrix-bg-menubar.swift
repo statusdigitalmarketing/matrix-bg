@@ -1,11 +1,13 @@
 import AppKit
 import ServiceManagement
 import Foundation
+import IOKit.pwr_mgt
 
 // MARK: - Config (UserDefaults)
 let kEnabled     = "screensaverEnabled"
 let kIdleSeconds = "idleSeconds"
 let kSkipMedia   = "skipMedia"
+let kKeepAwake   = "keepAwake"
 
 func defaults() -> UserDefaults { UserDefaults.standard }
 
@@ -146,11 +148,69 @@ final class RainController {
     }
 }
 
+// MARK: - Keep Awake Controller
+// When enabled, periodically tells macOS the user is active so the display,
+// screen saver, and lock-screen idle timers never elapse. Uses
+// IOPMAssertionDeclareUserActivity, the same signal the system receives from a
+// real mouse or keyboard event, so it needs no Accessibility permission and
+// never moves the cursor. A virtual mouse jiggle.
+//
+// Main-thread only. start()/stop() are driven from menu actions and the app
+// delegate (both main thread), and the timer runs on the main run loop. No
+// background access touches this class, so unlike RainController it needs no
+// internal locking.
+
+final class KeepAwakeController {
+    // Fire well under the shortest practical screen-lock timeout (1 minute).
+    private let interval: TimeInterval = 30
+    private var timer: Timer?
+    private var assertionID: IOPMAssertionID = 0
+
+    var isActive: Bool { timer != nil }
+
+    func start() {
+        guard timer == nil else { return }
+        declareActivity()
+        // Add to .common modes so the timer keeps firing while a menu or other
+        // modal tracking loop is open. Timer.scheduledTimer runs in .default
+        // mode only and would stall there.
+        let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            self?.declareActivity()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+        // The UserIsActive assertion is held until released, so dropping the
+        // timer is not enough: release it now or the Mac stays awake after
+        // the toggle is switched off. Reset the id so a later start() opens a
+        // fresh assertion.
+        if assertionID != 0 {
+            IOPMAssertionRelease(assertionID)
+            assertionID = 0
+        }
+    }
+
+    private func declareActivity() {
+        let result = IOPMAssertionDeclareUserActivity(
+            "matrix-bg Keep Awake" as CFString,
+            kIOPMUserActiveLocal,
+            &assertionID)
+        if result != kIOReturnSuccess {
+            NSLog("matrix-bg: Keep Awake user-activity declaration failed (\(result))")
+        }
+    }
+}
+
 // MARK: - App Delegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
     let rain = RainController()
+    let keepAwake = KeepAwakeController()
     var idleTimer: Timer?
     // Prevents idleTick from spawning a new background watcher on every fire
     var watchingForActivity = false
@@ -171,6 +231,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
         startIdleTimer()
+
+        if getBool(kKeepAwake, false) { keepAwake.start() }
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -183,6 +245,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         idleTimer?.invalidate()
         idleTimer = nil
         rain.stop()
+        keepAwake.stop()
     }
 
     // MARK: Menu
@@ -234,6 +297,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         skip.target = self
         skip.state = getBool(kSkipMedia, true) ? .on : .off
         menu.addItem(skip)
+
+        menu.addItem(.separator())
+
+        let keepAwakeItem = NSMenuItem(title: "Keep Awake",
+                                       action: #selector(toggleKeepAwake), keyEquivalent: "")
+        keepAwakeItem.target = self
+        keepAwakeItem.state = getBool(kKeepAwake, false) ? .on : .off
+        keepAwakeItem.toolTip = "Stops the display from sleeping or locking while enabled."
+        menu.addItem(keepAwakeItem)
 
         menu.addItem(.separator())
 
@@ -292,6 +364,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = buildMenu()
     }
 
+    @objc func toggleKeepAwake() {
+        let enabled = !getBool(kKeepAwake, false)
+        defaults().set(enabled, forKey: kKeepAwake)
+        if enabled { keepAwake.start() } else { keepAwake.stop() }
+        statusItem.menu = buildMenu()
+    }
+
     @objc func toggleLaunchAtLogin() {
         let cur = launchAtLoginEnabled()
         setLaunchAtLogin(!cur)
@@ -307,6 +386,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             • Idle screensaver triggers after \(getInt(kIdleSeconds, 60))s of inactivity
             • Click "Run Fullscreen Now" to preview
             • Move mouse or press a key to dismiss fullscreen rain
+            • "Keep Awake" stops the display from sleeping or locking
 
             github.com/statusdigitalmarketing/matrix-bg
             """
