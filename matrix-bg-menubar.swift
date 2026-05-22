@@ -87,64 +87,74 @@ func unloadLegacyWatcher() {
 }
 
 // MARK: - Rain Process Manager
-// All mutation of `process` flows through `queue` so menu actions on the main
-// thread and the idle-watcher background block can't race.
+// Guards mutation of `process` and `_mode` against concurrent access from menu
+// actions (main thread) and the idle-watcher background block.
+//
+// Uses NSRecursiveLock instead of a serial DispatchQueue. The previous
+// dispatch-queue-based implementation tripped libdispatch's "dispatch_sync
+// called on queue already owned by current thread" assertion and crashed the
+// app (matrix-bg #1 follow-up, 2026-05-22, prior crashes May 15 and
+// May 22 11:28 / 17:19). The exact recursive caller could not be pinpointed
+// without symbolicated frames, but recursion can also slip in through any
+// Foundation/AppKit re-entrancy during `Process.run` / `terminate` /
+// `waitUntilExit` on the main thread. A recursive lock allows the same thread
+// to re-enter without aborting, and the mutual exclusion against the
+// background watcher is preserved.
 
 final class RainController {
-    private let queue = DispatchQueue(label: "matrix-bg.rain")
+    private let lock = NSRecursiveLock()
     private var process: Process?
     private var _mode: String?
 
-    var mode: String? { queue.sync { _mode } }
+    var mode: String? {
+        lock.lock(); defer { lock.unlock() }
+        return _mode
+    }
 
     func isRunning() -> Bool {
-        queue.sync {
-            if let p = process, p.isRunning { return true }
-            process = nil
-            _mode = nil
-            return false
-        }
+        lock.lock(); defer { lock.unlock() }
+        if let p = process, p.isRunning { return true }
+        process = nil
+        _mode = nil
+        return false
     }
 
     func start(fullscreen: Bool) {
-        queue.sync {
-            // Inline stop so we don't recursively grab the queue
-            if let p = process, p.isRunning {
-                p.terminate()
-                p.waitUntilExit()
-            }
-            process = nil
-            _mode = nil
+        lock.lock(); defer { lock.unlock() }
+        if let p = process, p.isRunning {
+            p.terminate()
+            p.waitUntilExit()
+        }
+        process = nil
+        _mode = nil
 
-            let bin = bundleBinaryURL()
-            guard FileManager.default.isExecutableFile(atPath: bin.path) else {
-                NSLog("matrix-bg-bin not found at \(bin.path)")
-                return
-            }
-            let p = Process()
-            p.executableURL = bin
-            p.arguments = fullscreen ? ["--fullscreen"] : []
-            p.standardOutput = Pipe()
-            p.standardError = Pipe()
-            do {
-                try p.run()
-                process = p
-                _mode = fullscreen ? "fullscreen" : "wallpaper"
-            } catch {
-                NSLog("Failed to launch matrix-bg-bin: \(error)")
-            }
+        let bin = bundleBinaryURL()
+        guard FileManager.default.isExecutableFile(atPath: bin.path) else {
+            NSLog("matrix-bg-bin not found at \(bin.path)")
+            return
+        }
+        let p = Process()
+        p.executableURL = bin
+        p.arguments = fullscreen ? ["--fullscreen"] : []
+        p.standardOutput = Pipe()
+        p.standardError = Pipe()
+        do {
+            try p.run()
+            process = p
+            _mode = fullscreen ? "fullscreen" : "wallpaper"
+        } catch {
+            NSLog("Failed to launch matrix-bg-bin: \(error)")
         }
     }
 
     func stop() {
-        queue.sync {
-            if let p = process, p.isRunning {
-                p.terminate()
-                p.waitUntilExit()
-            }
-            process = nil
-            _mode = nil
+        lock.lock(); defer { lock.unlock() }
+        if let p = process, p.isRunning {
+            p.terminate()
+            p.waitUntilExit()
         }
+        process = nil
+        _mode = nil
     }
 }
 
