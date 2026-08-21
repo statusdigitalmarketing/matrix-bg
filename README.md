@@ -112,6 +112,25 @@ Edit `matrix-bg.swift` and recompile (`make install`):
 | Drop speed | `0.25...1.15` | Range of fall speeds |
 | Drops/column | `2...3` | Rain density |
 
+## Windows
+
+`matrix-bg-windows.c` is a single-file Win32 + GDI port with the same simulation (charset, speeds, fade, colors, 60s auto-kill). Download the prebuilt `matrix-bg.exe` from [dobepros.com/matrix](https://dobepros.com/matrix), or build it yourself:
+
+```bash
+# On Windows (MSVC)
+cl /O2 matrix-bg-windows.c /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib
+
+# Cross-compile from macOS/Linux (brew install mingw-w64)
+make windows
+```
+
+```
+matrix-bg.exe               # wallpaper mode: rain renders BEHIND desktop icons (WorkerW)
+matrix-bg.exe --fullscreen  # screensaver mode: any input dismisses
+```
+
+Wallpaper mode uses the WorkerW window (the same mechanism Wallpaper Engine uses) so the rain draws behind desktop icons without touching your wallpaper file. On exit it re-applies the current wallpaper to clear the desktop.
+
 ## Uninstall
 
 ```bash

@@ -36,3 +36,21 @@
 - **FIX**: Swap the serial DispatchQueue for `NSRecursiveLock`. Same mutual-exclusion semantics, but the same thread can re-enter without libdispatch's abort. Belt-and-suspenders: a `~/Library/LaunchAgents/com.matrix-bg.watchdog.plist` with `KeepAlive={SuccessfulExit=false}` respawns MatrixBG within 1s if any other crash path ever fires (verified by SIGKILL).
 - **CONTEXT**: matrix-bg-menubar.swift `RainController`. Release build has no dSYM, so the exact recursive caller could not be symbolicated. `NSRecursiveLock` is the right primitive whenever same-thread re-entry is plausible but cross-thread mutual exclusion is still required.
 - **DETECTION**: `grep -n 'queue.sync' *.swift` for any DispatchQueue protecting state that crosses methods that may call each other (directly or through framework callbacks like Process/Pipe); prefer `NSRecursiveLock` or flatten the call graph.
+
+### [API] - 2026-08-21
+- **MISTAKE**: First draft of the GDI font-fallback loop in matrix-bg-windows.c called `DeleteObject` on the font that was still selected into the memory DC (created candidate, selected it, then deleted it on mismatch before selecting the next one).
+- **FIX**: Select the NEXT candidate first (which deselects the previous one), then delete the previous candidate. Same rule for every GDI object: never delete a bitmap/font/brush while a DC has it selected.
+- **CONTEXT**: matrix-bg-windows.c font fallback chain (MS Gothic, Yu Gothic UI, Meiryo, Consolas). Deleting a selected GDI object often silently works in testing and corrupts rendering in the field.
+- **DETECTION**: `grep -n "DeleteObject" matrix-bg-windows.c` and confirm each deletion happens only after a SelectObject swapped the object out.
+
+### [API] - 2026-08-21
+- **MISTAKE**: Fullscreen dismiss first shipped as a 20Hz `GetAsyncKeyState` poll over all VKs. Codex found two real gaps: a key pressed and released between two 50ms ticks is missed entirely, and scroll wheel input has no VK state at all, so wheel never dismissed.
+- **FIX**: Raw Input (`RegisterRawInputDevices` with `RIDEV_INPUTSINK` on a hidden window) delivers key/button/wheel events passively without focus or hooks, mirroring the macOS `addGlobalMonitorForEvents` model. Event-driven beats state-polling for input detection.
+- **CONTEXT**: matrix-bg-windows.c WM_INPUT handler. Any "react to input without stealing focus" requirement on Windows should reach for raw input, not GetAsyncKeyState scans.
+- **DETECTION**: `grep -n "GetAsyncKeyState" *.c` in a loop over VK codes is the smell; check whether tap-between-polls and wheel input are handled.
+
+### [Testing] - 2026-08-21
+- **MISTAKE**: Playwright screenshots of the dobepros /matrix hero were taken right after `networkidle`, catching the page mid entrance animation (matrixFadeIn staggers delays up to 1.1s), so the download buttons were invisible in the evidence screenshots even though DOM assertions passed.
+- **FIX**: `page.wait_for_timeout(2500)` after `networkidle` before screenshotting any page with CSS entrance animations, then read the screenshot back to confirm the elements are actually visible.
+- **CONTEXT**: Ship-test screenshots are evidence for humans. A passing DOM assertion with an empty-looking screenshot fails the "read the screenshot back" gate.
+- **DETECTION**: If a screenshot shows missing UI that DOM assertions say exists, grep the page CSS for `animation.*both` / `fadeIn` delays before assuming a bug.

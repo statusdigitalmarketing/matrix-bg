@@ -3,8 +3,11 @@ SOURCE = matrix-bg.swift
 MENUBAR_SOURCE = matrix-bg-menubar.swift
 INSTALL_DIR = $(HOME)/.local/bin
 APP_BUNDLE = MatrixBG.app
+WIN_SOURCE = matrix-bg-windows.c
+WIN_BINARY = matrix-bg.exe
+WIN_CC = x86_64-w64-mingw32-gcc
 
-.PHONY: build install app app-install clean
+.PHONY: build install app app-install windows clean
 
 build:
 	swiftc -O -o $(BINARY) $(SOURCE) -framework AppKit -framework CoreText
@@ -23,6 +26,12 @@ app-install: app
 	cp -R $(APP_BUNDLE) /Applications/
 	@echo "Installed to /Applications/$(APP_BUNDLE)"
 
+# Cross-compile the Windows build (brew install mingw-w64)
+windows:
+	$(WIN_CC) -O2 -Wall -Wextra -municode -mwindows $(WIN_SOURCE) -o $(WIN_BINARY) -lgdi32 -luser32
+	x86_64-w64-mingw32-strip $(WIN_BINARY)
+	@echo "Built $(WIN_BINARY)"
+
 clean:
-	rm -f $(BINARY)
+	rm -f $(BINARY) $(WIN_BINARY)
 	rm -rf $(APP_BUNDLE)
