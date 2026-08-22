@@ -22,3 +22,5 @@ MatrixBG.zip
 # Icon generation scratch
 icon-gen/
 matrix-bg.exe
+test/sim-parity-test
+test/.charset-*.txt

@@ -32,6 +32,17 @@ windows:
 	x86_64-w64-mingw32-strip $(WIN_BINARY)
 	@echo "Built $(WIN_BINARY)"
 
+# Prove the Windows port's simulation obeys the Swift app's rules: compiles the
+# shipped matrix-bg-windows.c natively via test/windows.h shims and executes it.
+sim-test:
+	cc -O2 -Wall -Itest test/sim-parity-test.c -o test/sim-parity-test
+	./test/sim-parity-test
+	./test/sim-parity-test charset > test/.charset-c.txt
+	swift test/charset.swift > test/.charset-swift.txt
+	diff -u test/.charset-c.txt test/.charset-swift.txt
+	@rm -f test/.charset-c.txt test/.charset-swift.txt
+	@echo "Charset identical between Swift and Windows builds"
+
 clean:
 	rm -f $(BINARY) $(WIN_BINARY)
 	rm -rf $(APP_BUNDLE)
