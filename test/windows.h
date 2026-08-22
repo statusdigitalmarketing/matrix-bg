@@ -11,6 +11,7 @@
 #define MATRIX_BG_TEST_WINSHIM_H
 
 #include <stddef.h>
+#include <stdio.h>
 #include <wchar.h>
 
 /* ---- Types ---- */
@@ -174,5 +175,7 @@ static inline DWORD GetTickCount(void) { return 0; }
 static inline WCHAR *GetCommandLineW(void) { return shim_empty_wstr; }
 static inline BOOL InvalidateRect(HWND h, const RECT *r, BOOL e) { (void)h;(void)r;(void)e; return 1; }
 static inline BOOL UpdateWindow(HWND h) { (void)h; return 1; }
+static inline DWORD GetTempPathW(DWORD n, WCHAR *b) { (void)n; if (b) b[0] = 0; return 0; } /* 0 = logging inert in tests */
+static inline FILE *_wfopen(const WCHAR *p, const WCHAR *m) { (void)p;(void)m; return NULL; }
 
 #endif /* MATRIX_BG_TEST_WINSHIM_H */

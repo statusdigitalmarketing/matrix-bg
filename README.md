@@ -131,6 +131,8 @@ matrix-bg.exe --fullscreen  # screensaver mode: any input dismisses
 
 Wallpaper mode uses the WorkerW window (the same mechanism Wallpaper Engine uses) so the rain draws behind desktop icons without touching your wallpaper file. On exit it re-applies the current wallpaper to clear the desktop.
 
+Each run overwrites a small diagnostic log at `%TEMP%\matrix-bg.log` (build stamp, mode, which desktop layer was found, font, and why it exited). If something misbehaves, that file is the first thing to check: `notepad %TEMP%\matrix-bg.log`.
+
 ## Uninstall
 
 ```bash

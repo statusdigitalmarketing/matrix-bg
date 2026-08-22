@@ -26,6 +26,31 @@
 #include <windows.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
+
+/* ---- Diagnostic log: %TEMP%\matrix-bg.log, overwritten each run ----
+ * The app is a silent GUI process; when something misbehaves on a machine we
+ * can't see, this is the only evidence. Kept tiny: a dozen lines per run. */
+static FILE *g_logFile;
+
+static void logOpen(void) {
+    WCHAR path[MAX_PATH];
+    DWORD n = GetTempPathW(MAX_PATH, path);
+    if (n == 0 || n > MAX_PATH - 14) return; /* need 13 chars + NUL for the name */
+    wcscat(path, L"matrix-bg.log");
+    g_logFile = _wfopen(path, L"w");
+}
+
+static void logMsg(const char *fmt, ...) {
+    if (!g_logFile) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(g_logFile, fmt, ap);
+    va_end(ap);
+    fputc('\n', g_logFile);
+    fflush(g_logFile);
+}
 
 /* ---- Tuning (mirrors matrix-bg.swift) ---- */
 #define CELL_W        14
@@ -126,7 +151,7 @@ static BOOL CALLBACK findWorkerW(HWND top, LPARAM lp) {
 
 static HWND acquireDesktopParent(void) {
     HWND progman = FindWindowW(L"Progman", NULL);
-    if (!progman) return NULL;
+    if (!progman) { logMsg("desktop: no Progman window found"); return NULL; }
     DWORD_PTR unused;
     /* Older builds respond to (0,0); Win11 24H2 wants (0xD, 1). Send both, harmless.
      * ABORTIFHUNG so a wedged Explorer can't stall our startup. */
@@ -134,9 +159,13 @@ static HWND acquireDesktopParent(void) {
     SendMessageTimeoutW(progman, 0x052C, 0xD, 1, SMTO_NORMAL | SMTO_ABORTIFHUNG, 1000, &unused);
     HWND workerw = NULL;
     EnumWindows(findWorkerW, (LPARAM)&workerw);
-    if (workerw) return workerw;
+    if (workerw) { logMsg("desktop: WorkerW %p (behind icons)", (void *)workerw); return workerw; }
     /* Win11 22H2+: DefView inside Progman, draw into Progman directly */
-    if (FindWindowExW(progman, NULL, L"SHELLDLL_DefView", NULL)) return progman;
+    if (FindWindowExW(progman, NULL, L"SHELLDLL_DefView", NULL)) {
+        logMsg("desktop: DefView inside Progman, parenting into Progman %p", (void *)progman);
+        return progman;
+    }
+    logMsg("desktop: no WorkerW and no DefView in Progman; using bottom-most fallback");
     return NULL;
 }
 
@@ -263,6 +292,7 @@ static LRESULT CALLBACK renderWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_NCHITTEST:
         return HTTRANSPARENT; /* never intercept clicks, matches ignoresMouseEvents */
     case WM_CLOSE:
+        logMsg("exit: render window WM_CLOSE");
         shutdownApp();
         return 0;
     case WM_DESTROY:
@@ -279,7 +309,11 @@ static LRESULT CALLBACK msgWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
             /* Explorer restarted and took our WorkerW child with it: bail out
              * cleanly instead of ticking a dead window until the auto-kill. */
-            if (g_wallpaperMode && !IsWindow(g_hwnd)) { shutdownApp(); return 0; }
+            if (g_wallpaperMode && !IsWindow(g_hwnd)) {
+                logMsg("exit: desktop parent window died (explorer restart?)");
+                shutdownApp();
+                return 0;
+            }
 
             if (g_fullscreen && g_armed) {
                 /* Belt and suspenders next to the WM_INPUT path: dismiss on
@@ -287,13 +321,18 @@ static LRESULT CALLBACK msgWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 POINT p;
                 if (GetCursorPos(&p)) {
                     int dx = p.x - g_armOrigin.x, dy = p.y - g_armOrigin.y;
-                    if (dx * dx + dy * dy > 25) { shutdownApp(); return 0; }
+                    if (dx * dx + dy * dy > 25) {
+                        logMsg("dismiss: mouse moved (timer check)");
+                        shutdownApp();
+                        return 0;
+                    }
                 }
             }
 
             render();
             InvalidateRect(g_hwnd, NULL, FALSE);
         } else if (w == TIMER_KILL) {
+            logMsg("exit: 60s auto-kill");
             shutdownApp();
         } else if (w == TIMER_ARM) {
             KillTimer(h, TIMER_ARM);
@@ -311,18 +350,25 @@ static LRESULT CALLBACK msgWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (GetRawInputData((HRAWINPUT)l, RID_INPUT, &ri, &size,
                                 sizeof(RAWINPUTHEADER)) != (UINT)-1) {
                 if (ri.header.dwType == RIM_TYPEKEYBOARD) {
-                    if (!(ri.data.keyboard.Flags & RI_KEY_BREAK)) shutdownApp();
+                    if (!(ri.data.keyboard.Flags & RI_KEY_BREAK)) {
+                        logMsg("dismiss: key press");
+                        shutdownApp();
+                    }
                 } else if (ri.header.dwType == RIM_TYPEMOUSE) {
                     USHORT bf = ri.data.mouse.usButtonFlags;
                     if (bf & (RI_MOUSE_LEFT_BUTTON_DOWN | RI_MOUSE_RIGHT_BUTTON_DOWN |
                               RI_MOUSE_MIDDLE_BUTTON_DOWN | RI_MOUSE_BUTTON_4_DOWN |
                               RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_WHEEL | RI_MOUSE_HWHEEL)) {
+                        logMsg("dismiss: mouse button or wheel");
                         shutdownApp();
                     } else {
                         POINT p;
                         if (GetCursorPos(&p)) {
                             int dx = p.x - g_armOrigin.x, dy = p.y - g_armOrigin.y;
-                            if (dx * dx + dy * dy > 25) shutdownApp();
+                            if (dx * dx + dy * dy > 25) {
+                                logMsg("dismiss: mouse moved");
+                                shutdownApp();
+                            }
                         }
                     }
                 }
@@ -330,12 +376,17 @@ static LRESULT CALLBACK msgWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         break; /* WM_INPUT must still reach DefWindowProc for cleanup */
     case WM_CLOSE:            /* taskkill (no /F) lands here */
+        logMsg("exit: WM_CLOSE");
         shutdownApp();
         return 0;
     case WM_QUERYENDSESSION:
         return TRUE;
     case WM_ENDSESSION:
-        if (w) { g_shuttingDown = TRUE; if (g_wallpaperMode) refreshWallpaper(); }
+        if (w) {
+            logMsg("exit: session ending");
+            g_shuttingDown = TRUE;
+            if (g_wallpaperMode) refreshWallpaper();
+        }
         return 0;
     case WM_DESTROY:
         return 0;
@@ -345,7 +396,10 @@ static LRESULT CALLBACK msgWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdLine, int show) {
     (void)prev; (void)show; (void)cmdLine;
+    logOpen();
+    logMsg("matrix-bg.exe build %s %s", __DATE__, __TIME__);
     g_fullscreen = wcsstr(GetCommandLineW(), L"--fullscreen") != NULL;
+    logMsg("mode: %s", g_fullscreen ? "fullscreen" : "wallpaper");
     srand(GetTickCount());
     SetProcessDPIAware();
 
@@ -353,7 +407,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdLine, int show) {
     int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
     g_width  = GetSystemMetrics(SM_CXVIRTUALSCREEN);
     g_height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    if (g_width < 1 || g_height < 1) return 1;
+    logMsg("virtual screen: %dx%d at (%d,%d)", g_width, g_height, vx, vy);
+    if (g_width < 1 || g_height < 1) { logMsg("FATAL: empty virtual screen"); return 1; }
 
     WNDCLASSW wc = {0};
     wc.lpfnWndProc = renderWndProc;
@@ -404,14 +459,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdLine, int show) {
                                      vx, vy, g_width, g_height, NULL, NULL, inst, NULL);
         }
     }
-    if (!g_hwnd) return 1;
+    if (!g_hwnd) { logMsg("FATAL: CreateWindowExW failed"); return 1; }
+    logMsg("render window: %p (wallpaperMode=%d, fullscreen=%d)",
+           (void *)g_hwnd, g_wallpaperMode, g_fullscreen);
 
     /* Double buffer + font */
     HDC screen = GetDC(g_hwnd);
     g_memDC = CreateCompatibleDC(screen);
     g_memBmp = CreateCompatibleBitmap(screen, g_width, g_height);
     ReleaseDC(g_hwnd, screen);
-    if (!g_memDC || !g_memBmp) return 1;
+    if (!g_memDC || !g_memBmp) { logMsg("FATAL: double buffer creation failed"); return 1; }
     g_memBmpOld = (HBITMAP)SelectObject(g_memDC, g_memBmp);
 
     /* MS Gothic ships with Windows and covers half-width katakana; fall back
@@ -429,6 +486,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdLine, int show) {
         WCHAR got[LF_FACESIZE] = L"";
         GetTextFaceW(g_memDC, LF_FACESIZE, got);
         if (_wcsicmp(got, faces[f]) == 0) break;  /* real match, keep it */
+    }
+    {
+        WCHAR face[LF_FACESIZE] = L"";
+        GetTextFaceW(g_memDC, LF_FACESIZE, face);
+        logMsg("font: %ls", face);
     }
     SetBkMode(g_memDC, TRANSPARENT);
     SetTextAlign(g_memDC, TA_LEFT | TA_BASELINE);
@@ -450,7 +512,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdLine, int show) {
         rid[0].dwFlags = RIDEV_INPUTSINK; rid[0].hwndTarget = g_msgWnd;
         rid[1].usUsagePage = 0x01; rid[1].usUsage = 0x02;
         rid[1].dwFlags = RIDEV_INPUTSINK; rid[1].hwndTarget = g_msgWnd;
-        RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE));
+        BOOL riOk = RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE));
+        logMsg("raw input registered: %d", riOk);
         /* If registration fails, the 5px cursor check and 60s auto-kill in the
          * tick handler still dismiss; keys/wheel just lose their shortcut. */
     }
