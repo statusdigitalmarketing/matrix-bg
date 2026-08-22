@@ -114,7 +114,9 @@ Edit `matrix-bg.swift` and recompile (`make install`):
 
 ## Windows
 
-`matrix-bg-windows.c` is a single-file Win32 + GDI port with the same simulation (charset, speeds, fade, colors, 60s auto-kill). Download the prebuilt `matrix-bg.exe` from [dobepros.com/matrix](https://dobepros.com/matrix), or build it yourself:
+The shipped Windows app is **`windows/MatrixBG.cs`**: a single-file C# tray app (contributed by Jacob Alsaffar, reviewed and built here) with background rain behind the desktop icons, a fullscreen idle/git-triggered overlay, colors and blend modes, and Windows 11 24H2/25H2 support via the layered-child-of-Progman attach (the classic WorkerW trick stopped rendering on build 26100+). Download it from [dobepros.com/matrix](https://dobepros.com/matrix) or build with `windows/build.cmd` on any Windows box. Details in `windows/README.md`.
+
+`matrix-bg-windows.c` is the earlier minimal Win32 + GDI port with the same simulation as the Mac CLI (charset, speeds, fade, colors, 60s auto-kill). Its wallpaper mode does not render on Windows 11 24H2+; it is kept for reference and older systems. Build it yourself:
 
 ```bash
 # On Windows (MSVC)

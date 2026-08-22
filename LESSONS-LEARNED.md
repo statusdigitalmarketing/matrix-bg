@@ -54,3 +54,9 @@
 - **FIX**: `page.wait_for_timeout(2500)` after `networkidle` before screenshotting any page with CSS entrance animations, then read the screenshot back to confirm the elements are actually visible.
 - **CONTEXT**: Ship-test screenshots are evidence for humans. A passing DOM assertion with an empty-looking screenshot fails the "read the screenshot back" gate.
 - **DETECTION**: If a screenshot shows missing UI that DOM assertions say exists, grep the page CSS for `animation.*both` / `fadeIn` delays before assuming a bug.
+
+### [Architecture] - 2026-08-22
+- **MISTAKE**: The C Windows port's wallpaper mode silently draws nothing on Windows 11 24H2/25H2 (build 26100+). Progman is now created with WS_EX_NOREDIRECTIONBITMAP and SHELLDLL_DefView is a layered child, so a plain non-layered WS_CHILD (our Progman-direct fallback) is never composited. Report came from a real 24H2 machine via Jacob.
+- **FIX**: The technique that works (same as Lively Wallpaper, now in windows/MatrixBG.cs): send Progman 0x052C (0xD,1); make the window WS_CHILD|WS_CLIPSIBLINGS|WS_CLIPCHILDREN with WS_EX_LAYERED|WS_EX_TOOLWINDOW|WS_EX_CONTROLPARENT|WS_EX_NOACTIVATE + SetLayeredWindowAttributes(alpha 255); SetParent to Progman z-ordered directly under SHELLDLL_DefView; then nudge the size (w-1/h-1 then full) because DWM only starts compositing after a size change. Classic WorkerW child remains the fallback for older builds.
+- **CONTEXT**: Any "draw behind desktop icons" feature must branch on GetWindowLong(Progman, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP to pick the attach strategy. The windows/ C# app does this in Native.Probe(); matrix-bg-windows.c retains the old approach and is superseded as the shipped Windows artifact.
+- **DETECTION**: On any new Windows build, run with --debug and check the attach log line; visually confirm rain BEHIND icons, not absent and not covering them.
