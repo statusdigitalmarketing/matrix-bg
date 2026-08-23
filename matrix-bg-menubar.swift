@@ -8,6 +8,10 @@ let kEnabled     = "screensaverEnabled"
 let kIdleSeconds = "idleSeconds"
 let kSkipMedia   = "skipMedia"
 let kKeepAwake   = "keepAwake"
+let kColorHex    = "colorHex"      // "classic" or RRGGBB
+let kColor2Hex   = "color2Hex"     // RRGGBB
+let kBlend       = "blendMode"     // 0 off, 1 time fade, 2 left-right, 3 top-bottom, 4 mixed, 5 mixed drifting
+let kRainbow     = "rainbowCycle"
 
 func defaults() -> UserDefaults { UserDefaults.standard }
 
@@ -18,6 +22,51 @@ func getBool(_ key: String, _ fallback: Bool) -> Bool {
 func getInt(_ key: String, _ fallback: Int) -> Int {
     if defaults().object(forKey: key) == nil { return fallback }
     return defaults().integer(forKey: key)
+}
+func getString(_ key: String, _ fallback: String) -> String {
+    defaults().string(forKey: key) ?? fallback
+}
+
+// Same palette as the Windows tray app. "classic" keeps the CLI's original
+// hardcoded green ramp (its exact-parity path); everything else is a hex color.
+let greenPresets: [(String, String)] = [
+    ("Matrix Green (classic)", "classic"),
+    ("Phosphor", "3CFF6E"), ("Neon Lime", "78FF28"), ("Emerald", "00DC64"),
+    ("Jade", "00C88C"), ("Deep Forest", "00AA32"), ("Mint", "96FFBE"), ("Sea Green", "00E6BE"),
+]
+let otherPresets: [(String, String)] = [
+    ("Neon Cyan", "00E6FF"), ("Electric Blue", "286EFF"), ("Purple Haze", "B43CFF"),
+    ("Hot Pink", "FF32AA"), ("Blood Red", "FF1E1E"), ("Amber", "FFB000"), ("Ice White", "DCE6F0"),
+]
+let blendNames = ["Off (single colour)", "Fade between the two over time",
+                  "Side by side (left to right)", "Top to bottom",
+                  "Mixed (each streak its own colour)", "Mixed + fading (streaks drift)"]
+
+// Args passed to matrix-bg-bin so the renderer matches the menu settings.
+func colorArgs() -> [String] {
+    var a: [String] = []
+    let hex = getString(kColorHex, "classic")
+    if hex != "classic" { a += ["--color", hex] }
+    a += ["--color2", getString(kColor2Hex, "00E6FF")]
+    let blend = getInt(kBlend, 0)
+    if blend != 0 { a += ["--blend", String(blend)] }
+    if getBool(kRainbow, false) { a.append("--rainbow") }
+    return a
+}
+
+func swatch(_ hex: String) -> NSImage {
+    let h = hex == "classic" ? "1AFF33" : hex
+    let v = UInt32(h, radix: 16) ?? 0x1AFF33
+    let color = NSColor(red: CGFloat((v >> 16) & 0xFF) / 255, green: CGFloat((v >> 8) & 0xFF) / 255,
+                        blue: CGFloat(v & 0xFF) / 255, alpha: 1)
+    let img = NSImage(size: NSSize(width: 14, height: 14))
+    img.lockFocus()
+    NSColor.black.setFill()
+    NSBezierPath(roundedRect: NSRect(x: 0, y: 0, width: 14, height: 14), xRadius: 3, yRadius: 3).fill()
+    color.setFill()
+    NSBezierPath(roundedRect: NSRect(x: 2, y: 2, width: 10, height: 10), xRadius: 2, yRadius: 2).fill()
+    img.unlockFocus()
+    return img
 }
 
 // MARK: - Helpers
@@ -135,7 +184,7 @@ final class RainController {
         }
         let p = Process()
         p.executableURL = bin
-        p.arguments = fullscreen ? ["--fullscreen"] : []
+        p.arguments = (fullscreen ? ["--fullscreen"] : []) + colorArgs()
         p.standardOutput = Pipe()
         p.standardError = Pipe()
         do {
@@ -310,6 +359,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
+        // --- Colours (matches the Windows tray app)
+        let curHex = getString(kColorHex, "classic")
+        let rainbowOn = getBool(kRainbow, false)
+
+        let colorItem = NSMenuItem(title: "Colour", action: nil, keyEquivalent: "")
+        let colorSub = NSMenu()
+        for (name, hex) in greenPresets {
+            let mi = NSMenuItem(title: name, action: #selector(setColor(_:)), keyEquivalent: "")
+            mi.target = self
+            mi.representedObject = hex
+            mi.image = swatch(hex)
+            mi.state = (!rainbowOn && hex == curHex) ? .on : .off
+            colorSub.addItem(mi)
+        }
+        colorSub.addItem(.separator())
+        let moreItem = NSMenuItem(title: "More Colours", action: nil, keyEquivalent: "")
+        let moreSub = NSMenu()
+        for (name, hex) in otherPresets {
+            let mi = NSMenuItem(title: name, action: #selector(setColor(_:)), keyEquivalent: "")
+            mi.target = self
+            mi.representedObject = hex
+            mi.image = swatch(hex)
+            mi.state = (!rainbowOn && hex == curHex) ? .on : .off
+            moreSub.addItem(mi)
+        }
+        moreItem.submenu = moreSub
+        colorSub.addItem(moreItem)
+        let rainbow = NSMenuItem(title: "Rainbow Cycle", action: #selector(toggleRainbow), keyEquivalent: "")
+        rainbow.target = self
+        rainbow.state = rainbowOn ? .on : .off
+        colorSub.addItem(rainbow)
+        colorItem.submenu = colorSub
+        menu.addItem(colorItem)
+
+        let cur2 = getString(kColor2Hex, "00E6FF")
+        let color2Item = NSMenuItem(title: "Second Colour (for blends)", action: nil, keyEquivalent: "")
+        let color2Sub = NSMenu()
+        for (name, hex) in greenPresets.map({ ($0.0, $0.1 == "classic" ? "1AFF33" : $0.1) }) + otherPresets {
+            let mi = NSMenuItem(title: name, action: #selector(setColor2(_:)), keyEquivalent: "")
+            mi.target = self
+            mi.representedObject = hex
+            mi.image = swatch(hex)
+            mi.state = (hex == cur2) ? .on : .off
+            color2Sub.addItem(mi)
+        }
+        color2Item.submenu = color2Sub
+        menu.addItem(color2Item)
+
+        let curBlend = getInt(kBlend, 0)
+        let blendItem = NSMenuItem(title: "Two-Colour Blend", action: nil, keyEquivalent: "")
+        let blendSub = NSMenu()
+        for (i, name) in blendNames.enumerated() {
+            let mi = NSMenuItem(title: name, action: #selector(setBlend(_:)), keyEquivalent: "")
+            mi.target = self
+            mi.tag = i
+            mi.state = (i == curBlend) ? .on : .off
+            blendSub.addItem(mi)
+        }
+        blendItem.submenu = blendSub
+        menu.addItem(blendItem)
+
+        menu.addItem(.separator())
+
         let keepAwakeItem = NSMenuItem(title: "Keep Awake",
                                        action: #selector(toggleKeepAwake), keyEquivalent: "")
         keepAwakeItem.target = self
@@ -385,6 +497,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let cur = launchAtLoginEnabled()
         setLaunchAtLogin(!cur)
         statusItem.menu = buildMenu()
+    }
+
+    // MARK: Colour actions
+    // Restart the rain (same mode) after a change so it applies immediately.
+    func applyColorChange() {
+        if rain.isRunning() { rain.start(fullscreen: rain.mode == "fullscreen") }
+        statusItem.menu = buildMenu()
+    }
+
+    @objc func setColor(_ sender: NSMenuItem) {
+        defaults().set(sender.representedObject as? String ?? "classic", forKey: kColorHex)
+        defaults().set(false, forKey: kRainbow)
+        applyColorChange()
+    }
+
+    @objc func setColor2(_ sender: NSMenuItem) {
+        defaults().set(sender.representedObject as? String ?? "00E6FF", forKey: kColor2Hex)
+        applyColorChange()
+    }
+
+    @objc func setBlend(_ sender: NSMenuItem) {
+        defaults().set(sender.tag, forKey: kBlend)
+        applyColorChange()
+    }
+
+    @objc func toggleRainbow() {
+        defaults().set(!getBool(kRainbow, false), forKey: kRainbow)
+        applyColorChange()
     }
 
     @objc func showAbout() {

@@ -51,8 +51,20 @@ matrix-bg
 # Fullscreen screensaver (covers everything, any input dismisses)
 matrix-bg --fullscreen
 
+# Colors (same options as the Windows tray app; defaults to classic green)
+matrix-bg --color FF32AA                 # any RRGGBB
+matrix-bg --rainbow                      # hue cycles over time
+matrix-bg --color FF32AA --color2 286EFF --blend 4
+#   --blend 1  fade between the two colors over time
+#   --blend 2  side by side (left to right)
+#   --blend 3  top to bottom
+#   --blend 4  mixed (each streak its own color)
+#   --blend 5  mixed + fading (streaks drift between the two)
+
 # Ctrl+C to quit, or it auto-exits after 60 seconds
 ```
+
+The MatrixBG.app menu bar app exposes all of this under Colour / Second Colour / Two-Colour Blend, with the same presets as the Windows tray app.
 
 ### Idle Screensaver
 
