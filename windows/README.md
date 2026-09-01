@@ -29,6 +29,26 @@ the bulbs' previous state is captured and restored when the effect ends. Bridge 
 
 Double-click the icon = pause/resume. Settings: `%APPDATA%\MatrixBG\settings.txt` (plain `key=value`).
 
+## MIDI control (tray > MIDI control)
+Drive the rain live from an APC, Traktor, or anything that speaks MIDI. Pick an input port (install
+[loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html) for a virtual port if the source is software like
+Traktor) and enable. Default map, channel-agnostic unless `midichannel=` (1-16) is set in settings.txt:
+
+| Control | Effect |
+|---|---|
+| CC 20 | Speed (continuous, overrides the preset) |
+| CC 21 | Density (starves or floods streaks) |
+| CC 22 | Hue (replaces colour A; overrides rainbow; blends and Hue bulbs follow) |
+| CC 23 | Blend position (when a two-colour blend is on) |
+| CC 24 | Tail length |
+| CC 25 | Brightness |
+| Any Note On | Burst of drops, velocity-scaled |
+| Note 36 (C1) | Toggle the fullscreen overlay |
+| MIDI clock | Beat pulse every quarter note (Start resets the phase) |
+
+Overrides stay active until MIDI control is disabled. Tip: give MatrixBG its own loopMIDI port so an existing
+Traktor/APC mapping never collides with another app's use of the same controller.
+
 ## Command line
 - `--fullscreen` (or `--saver`) start the overlay immediately
 - `--window` run in a normal window (testing)

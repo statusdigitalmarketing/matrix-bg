@@ -44,6 +44,10 @@ namespace MatrixBG
         public string HueIp = "";
         public string HueUser = "";
         public string HueLights = "";          // comma-separated light ids; empty = all colour lights
+        // MIDI control
+        public bool MidiEnabled = false;
+        public string MidiPort = "";           // input device name; "" = none chosen yet
+        public int MidiChannel = 0;            // 0 = omni, 1-16 = only that channel
         public bool PauseOnVideo = true;       // audio is playing -> pause wallpaper, don't start saver
         public bool PauseWhenFullscreen = true;
         public bool KeepAwake = false;
@@ -88,6 +92,9 @@ namespace MatrixBG
                         case "huelights": s.HueLights = v; break;
                         case "huecolorgit": if (isInt) s.HueColorGit = n == 0 ? Color.Empty : Color.FromArgb(n); break;
                         case "huecoloridle": if (isInt) s.HueColorIdle = n == 0 ? Color.Empty : Color.FromArgb(n); break;
+                        case "midienabled": s.MidiEnabled = v == "1"; break;
+                        case "midiport": s.MidiPort = v; break;
+                        case "midichannel": if (isInt) s.MidiChannel = Clamp(n, 0, 16); break;
                         case "fontsize": if (isInt) s.FontSize = Clamp(n, 0, 4); break;
                         case "charset": if (isInt) s.Charset = Clamp(n, 0, 3); break;
                         case "paused": s.Paused = v == "1"; break;
@@ -128,6 +135,9 @@ namespace MatrixBG
                 sb.AppendLine("huelights=" + HueLights);
                 sb.AppendLine("huecolorgit=" + HueColorGit.ToArgb());
                 sb.AppendLine("huecoloridle=" + HueColorIdle.ToArgb());
+                sb.AppendLine("midienabled=" + B(MidiEnabled));
+                sb.AppendLine("midiport=" + MidiPort);
+                sb.AppendLine("midichannel=" + MidiChannel);
                 sb.AppendLine("fontsize=" + FontSize);
                 sb.AppendLine("charset=" + Charset);
                 sb.AppendLine("paused=" + B(Paused));
@@ -336,7 +346,28 @@ namespace MatrixBG
             return Color.FromArgb((int)(a.R + (b.R - a.R) * t), (int)(a.G + (b.G - a.G) * t), (int)(a.B + (b.B - a.B) * t));
         }
         readonly byte[] lut = new byte[256];
-        int lutTail = -1; float lutSpeed = -1f;
+        float lutKeep = -1f; float lutSpeed = -1f;
+
+        // MIDI overrides: written on the UI thread each tick before Step(); -1 = none.
+        public float MidiSpeedMul = -1f;   // 0.35..2.3, replaces the Speed preset
+        public float MidiDensity = -1f;    // 0..1, starves or floods respawns live
+        public float MidiHue = -1f;        // 0..360, replaces colour AND rainbow
+        public float MidiBlendT = -1f;     // 0..1, pins the blend position for all streaks
+        public float MidiTail = -1f;       // 0..1, retention between Short and Endless
+        public float MidiDim = -1f;        // 0..1 master brightness
+        public float BeatPulse = 0f;       // set to 1 on a MIDI clock beat, decays per frame
+
+        // Spawn n drops near the top on random columns (MIDI note bursts). UI thread only.
+        public void Burst(int n)
+        {
+            for (int j = 0; j < n && cols.Length > 0; j++)
+            {
+                int i = rnd.Next(cols.Length);
+                cols[i].Wait = 0;
+                cols[i].Y = -rnd.Next(0, 4);
+                cols[i].Speed = 0.5f + (float)rnd.NextDouble() * 0.9f;
+            }
+        }
 
         public int Width { get; private set; }
         public int Height { get; private set; }
@@ -433,13 +464,18 @@ namespace MatrixBG
             switch (s.Charset) { case 1: return BIN; case 2: return HEX; case 3: return LATIN; default: return KATA; }
         }
 
-        public Color CurrentColor() { return s.Rainbow ? FromHsv(hue, 1f, 1f) : s.Color; }
+        // A MIDI hue CC pins the colour, beating both the preset and rainbow, and the Hue
+        // lights read the same effective base so bulbs and rain always agree.
+        public Color CurrentColor() { if (MidiHue >= 0f) return FromHsv(MidiHue, 1f, 1f); return s.Rainbow ? FromHsv(hue, 1f, 1f) : s.Color; }
 
         // Colour the rain would use for "slot" i of n (used to give each Hue bulb its own place in a blend).
         public Color ColourFor(int i, int n)
         {
-            if (s.Rainbow) return FromHsv(hue + (n > 1 ? 360f * i / n : 0f), 1f, 1f);
-            if (s.Blend == 0) return s.Color;
+            // A MIDI hue replaces colour A but keeps its place in the blend, so bulbs
+            // still spread across the ramp exactly like the rain does.
+            if (MidiHue < 0f && s.Rainbow) return FromHsv(hue + (n > 1 ? 360f * i / n : 0f), 1f, 1f);
+            Color baseA = MidiHue >= 0f ? FromHsv(MidiHue, 1f, 1f) : s.Color;
+            if (s.Blend == 0) return baseA;
             float t;
             switch (s.Blend)
             {
@@ -448,7 +484,7 @@ namespace MatrixBG
                 case 4: t = (float)new Random(i * 7919 + 13).NextDouble(); break;
                 default: { float ph = (float)(((i / (float)Math.Max(1, n)) + blendPhase / (2 * Math.PI)) % 1.0); t = ph < 0.5f ? ph * 2f : 2f - ph * 2f; break; }
             }
-            return Lerp(s.Color, s.Color2, t);
+            return Lerp(baseA, s.Color2, t);
         }
 
         static Color FromHsv(float h, float sat, float v)
@@ -463,19 +499,22 @@ namespace MatrixBG
 
         // Multiplicative fade with a hard floor so trails really end at pure black
         // (GDI+ alpha fills round up and leave ghost outlines at ~12/255).
-        void Fade(float sp)
+        void Fade(float sp, float tailScale)
         {
-            if (lutTail != s.Tail || lutSpeed != sp)
+            float[] keep = { 0.80f, 0.88f, 0.93f, 0.955f, 0.972f, 0.985f };   // per-frame retention per tail setting
+            // MIDI tail rides the same retention range; the LUT cache is keyed on the
+            // EFFECTIVE retention so a live CC sweep rebuilds it (preset alone would not).
+            float baseKeep = tailScale >= 0f ? 0.80f + (0.985f - 0.80f) * tailScale : keep[s.Tail];
+            if (lutKeep != baseKeep || lutSpeed != sp)
             {
-                float[] keep = { 0.80f, 0.88f, 0.93f, 0.955f, 0.972f, 0.985f };   // per-frame retention per tail setting
-                float k = 1f - (1f - keep[s.Tail]) * (0.6f + 0.4f * sp);
+                float k = 1f - (1f - baseKeep) * (0.6f + 0.4f * sp);
                 for (int v = 0; v < 256; v++)
                 {
                     int nv = (int)(v * k);
                     if (nv == v && v > 0) nv = v - 1;        // always make progress
                     lut[v] = (byte)(nv < 5 ? 0 : nv);        // floor -> true black
                 }
-                lutTail = s.Tail; lutSpeed = sp;
+                lutKeep = baseKeep; lutSpeed = sp;
             }
             byte* basePtr = (byte*)dibBits; int stride = Width * 4; int w = Width;
             byte[] l = lut;
@@ -490,18 +529,28 @@ namespace MatrixBG
         public void Step()
         {
             if (back == null) return;
+            // Snapshot the MIDI overrides once per frame so a driver-thread write mid-frame
+            // can never produce an inconsistent palette/fade/speed combination.
+            float mSpeed = MidiSpeedMul, mDensity = MidiDensity, mHue = MidiHue,
+                  mBlendT = MidiBlendT, mTail = MidiTail, mDim = MidiDim, mBeat = BeatPulse;
+            BeatPulse *= 0.80f; if (BeatPulse < 0.02f) BeatPulse = 0f;   // ~250 ms decay
+
             float[] speedMul = { 0.35f, 0.6f, 1f, 1.5f, 2.3f };
-            float sp = speedMul[s.Speed];
+            float sp = mSpeed > 0f ? mSpeed : speedMul[s.Speed];
             if (s.Rainbow) hue += 0.4f * sp;
-            Fade(sp);
+            Fade(sp, mTail);
 
             // Colour palette for this frame: a ramp of STEPS colours between colour A and B (blend modes),
             // or a single colour. Each drop picks its ramp index from time / x / y.
             const int STEPS = 24;
-            Color a = CurrentColor(), b = s.Color2;
+            // A hue CC replaces colour A only; the two-colour blend (and CC 23) stay live.
+            Color a = mHue >= 0f ? FromHsv(mHue, 1f, 1f) : CurrentColor(), b = s.Color2;
             blendPhase += 0.004f * sp;
-            bool blend = s.Blend != 0 && !s.Rainbow;
+            bool blend = s.Blend != 0 && (!s.Rainbow || mHue >= 0f);   // a hue CC also overrides rainbow
             int steps = blend ? STEPS : 1;
+            // Master brightness: dim CC scales down, a clock beat pushes up briefly.
+            float lum = (mDim >= 0f ? 0.15f + 0.85f * mDim : 1f) * (1f + 0.35f * mBeat);
+            int headAdd = (int)(180 * Math.Min(1f, lum));   // heads must dim with the master too
             SolidBrush[] bHeads = new SolidBrush[steps], bBodies = new SolidBrush[steps], bDims = new SolidBrush[steps];
             try
             {
@@ -509,8 +558,10 @@ namespace MatrixBG
             {
                 float t = steps == 1 ? 0f : (float)k / (steps - 1);
                 Color c = Lerp(a, b, t);
+                if (lum != 1f)
+                    c = Color.FromArgb(Math.Min(255, (int)(c.R * lum)), Math.Min(255, (int)(c.G * lum)), Math.Min(255, (int)(c.B * lum)));
                 bBodies[k] = new SolidBrush(c);
-                bHeads[k] = new SolidBrush(Color.FromArgb(Math.Min(255, c.R + 180), Math.Min(255, c.G + 180), Math.Min(255, c.B + 180)));
+                bHeads[k] = new SolidBrush(Color.FromArgb(Math.Min(255, c.R + headAdd), Math.Min(255, c.G + headAdd), Math.Min(255, c.B + headAdd)));
                 bDims[k] = new SolidBrush(Color.FromArgb(150, c));
             }
             float timeT = (float)(Math.Sin(blendPhase) * 0.5 + 0.5);
@@ -521,14 +572,27 @@ namespace MatrixBG
                 g.TextRenderingHint = TextRenderingHint.AntiAlias;
                 for (int i = 0; i < cols.Length; i++)
                 {
-                    if (cols[i].Wait > 0) { cols[i].Wait--; continue; }
+                    if (cols[i].Wait > 0)
+                    {
+                        // Density CC reshapes respawn pacing live: high floods (waits burn
+                        // faster), low starves (waits sometimes don't tick down at all).
+                        int dec = 1;
+                        if (mDensity >= 0f)
+                        {
+                            if (mDensity >= 0.5f) dec = 1 + (int)((mDensity - 0.5f) * 10f);          // 1..6
+                            else if (rnd.NextDouble() < (0.5f - mDensity) * 1.6f) dec = 0;           // sparse
+                        }
+                        cols[i].Wait -= dec; if (cols[i].Wait < 0) cols[i].Wait = 0;
+                        continue;
+                    }
                     cols[i].Y += cols[i].Speed * sp;
                     int row = (int)cols[i].Y;
                     if (row - cols[i].Len > rows) { Reset(ref cols[i], false, i); continue; }
 
                     float x = (i % nCols) * cellW;
                     int k = 0;
-                    if (blend)
+                    if (mBlendT >= 0f && steps > 1) k = (int)(mBlendT * (STEPS - 1) + 0.5f);
+                    else if (blend)
                     {
                         float t;
                         switch (s.Blend)
@@ -958,6 +1022,155 @@ namespace MatrixBG
         public void Dispose() { running = false; gen++; if (worker != null && worker.IsAlive) worker.Join(10000); }   // long join: quitting must not strand the lights mid-effect
     }
 
+    // ------------------------------------------------------------------ MIDI control (winmm)
+    // An APC / Traktor (optionally through a loopMIDI virtual port) drives the rain live.
+    // The winmm callback runs on a DRIVER thread and only parses short messages into
+    // primitive fields; the 33 ms UI tick consumes them. Events (note bursts, overlay
+    // toggle, beats) are Interlocked counters so hits between ticks are never lost.
+    // Default map (README): CC 20 speed, 21 density, 22 hue, 23 blend position, 24 tail,
+    // 25 brightness; any Note On = drop burst (velocity-scaled); note 36 (C1) toggles the
+    // overlay; MIDI clock 0xF8 pulses the field every 24 ticks (Start/Stop reset phase).
+    class Midi : IDisposable
+    {
+        [DllImport("winmm.dll")] static extern uint midiInGetNumDevs();
+        [DllImport("winmm.dll", CharSet = CharSet.Unicode)] static extern uint midiInGetDevCaps(IntPtr id, ref MIDIINCAPS caps, uint size);
+        [DllImport("winmm.dll")] static extern uint midiInOpen(out IntPtr h, uint id, MidiInProc cb, IntPtr inst, uint flags);
+        [DllImport("winmm.dll")] static extern uint midiInStart(IntPtr h);
+        [DllImport("winmm.dll")] static extern uint midiInStop(IntPtr h);
+        [DllImport("winmm.dll")] static extern uint midiInReset(IntPtr h);
+        [DllImport("winmm.dll")] static extern uint midiInClose(IntPtr h);
+        delegate void MidiInProc(IntPtr h, uint msg, IntPtr inst, IntPtr p1, IntPtr p2);
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct MIDIINCAPS
+        {
+            public ushort Mid, Pid; public uint DriverVersion;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string Name;
+            public uint Support;
+        }
+        const uint CALLBACK_FUNCTION = 0x30000;
+        const uint MIM_DATA = 0x3C3, MIM_MOREDATA = 0x3CC;
+
+        readonly Settings s;
+        readonly MidiInProc proc;   // held so the GC never collects the native callback
+        IntPtr handle = IntPtr.Zero;
+        volatile bool closing;
+        public string OpenPortName = "";
+        public string LastError = "";
+
+        // Last-value CC overrides (-1 = untouched since enable); single writer (driver thread)
+        public volatile int CcSpeed = -1, CcDensity = -1, CcHue = -1, CcBlend = -1, CcTail = -1, CcDim = -1;
+        public volatile int ActivitySeq = 0;   // bumps on every accepted message (tray indicator)
+        int burstPending, overlayToggles, beatSeq;
+        volatile int clockTicks = -1;
+        int lastBeatSeen;   // UI thread only
+
+        public Midi(Settings settings) { s = settings; proc = InProc; }
+
+        public string[] Ports()
+        {
+            uint n = midiInGetNumDevs();
+            string[] names = new string[n];
+            for (uint i = 0; i < n; i++)
+            {
+                MIDIINCAPS caps = new MIDIINCAPS();
+                names[i] = midiInGetDevCaps(new IntPtr(i), ref caps, (uint)Marshal.SizeOf(typeof(MIDIINCAPS))) == 0 ? caps.Name : ("(device " + i + ")");
+            }
+            return names;
+        }
+
+        public bool Open(string portName)
+        {
+            Close();
+            string[] ports = Ports();
+            int idx = -1;
+            for (int i = 0; i < ports.Length; i++) if (ports[i] == portName) { idx = i; break; }
+            if (idx < 0) { LastError = "port not found: " + portName; return false; }
+            IntPtr h;
+            uint rc = midiInOpen(out h, (uint)idx, proc, IntPtr.Zero, CALLBACK_FUNCTION);
+            if (rc != 0) { LastError = "midiInOpen failed (" + rc + ")"; return false; }
+            handle = h;
+            midiInStart(handle);
+            OpenPortName = portName;
+            LastError = "";
+            Program.Log("midi: listening on " + portName);
+            return true;
+        }
+
+        public void Close()
+        {
+            if (handle == IntPtr.Zero) return;
+            closing = true;             // callback becomes a no-op before teardown
+            midiInStop(handle);
+            midiInReset(handle);
+            midiInClose(handle);
+            handle = IntPtr.Zero;
+            OpenPortName = "";
+            closing = false;
+            ResetOverrides();
+        }
+
+        public void ResetOverrides()
+        {
+            CcSpeed = CcDensity = CcHue = CcBlend = CcTail = CcDim = -1;
+            clockTicks = -1;
+            Interlocked.Exchange(ref burstPending, 0);
+            Interlocked.Exchange(ref overlayToggles, 0);
+            lastBeatSeen = Thread.VolatileRead(ref beatSeq);   // no phantom beat on re-enable
+        }
+
+        // UI-tick consumers
+        public int TakeBursts() { return Interlocked.Exchange(ref burstPending, 0); }
+        public int TakeOverlayToggles() { return Interlocked.Exchange(ref overlayToggles, 0); }
+        public bool TakeBeat() { int b = Thread.VolatileRead(ref beatSeq); if (b != lastBeatSeen) { lastBeatSeen = b; return true; } return false; }
+
+        void InProc(IntPtr h, uint msg, IntPtr inst, IntPtr p1, IntPtr p2)
+        {
+            // Driver thread: no allocation, no locks, no logging, no UI. We never queue
+            // sysex buffers, so MIM_LONGDATA needs no cleanup and is simply ignored.
+            if (closing) return;
+            if (msg != MIM_DATA && msg != MIM_MOREDATA) return;
+            int packed = unchecked((int)(p1.ToInt64() & 0xFFFFFFFF));
+            int status = packed & 0xFF, d1 = (packed >> 8) & 0x7F, d2 = (packed >> 16) & 0x7F;
+
+            if (status == 0xF8)   // clock: beat every 24 ticks, phase-based (BPM would jitter)
+            {
+                int t = clockTicks + 1;
+                if (t <= 0 || t >= 24) { t = 0; Interlocked.Increment(ref beatSeq); }
+                clockTicks = t;
+                ActivitySeq++;
+                return;
+            }
+            if (status == 0xFA || status == 0xFC) { clockTicks = -1; return; }   // start/stop: next clock is beat 0
+
+            int type = status & 0xF0, chan = status & 0x0F;
+            if (type < 0x80 || type == 0xF0) return;
+            if (s.MidiChannel != 0 && chan != s.MidiChannel - 1) return;
+
+            if (type == 0xB0)
+            {
+                switch (d1)
+                {
+                    case 20: CcSpeed = d2; break;
+                    case 21: CcDensity = d2; break;
+                    case 22: CcHue = d2; break;
+                    case 23: CcBlend = d2; break;
+                    case 24: CcTail = d2; break;
+                    case 25: CcDim = d2; break;
+                    default: return;
+                }
+                ActivitySeq++;
+            }
+            else if (type == 0x90 && d2 > 0)   // note on (velocity 0 = note off)
+            {
+                if (d1 == 36) Interlocked.Increment(ref overlayToggles);
+                else Interlocked.Add(ref burstPending, 1 + d2 / 8);   // 1..16 drops by velocity
+                ActivitySeq++;
+            }
+        }
+
+        public void Dispose() { Close(); }
+    }
+
     // ------------------------------------------------------------------ engine: timers, idle/saver logic, pause rules
     class Engine : IDisposable
     {
@@ -968,6 +1181,7 @@ namespace MatrixBG
         readonly TestWindow test;
         readonly AudioMeter audio = new AudioMeter();
         public readonly Hue Lights;
+        public readonly Midi MidiCtl;
         public Color RainColour() { return core.CurrentColor(); }
         public Color RainColourFor(int i, int n) { return core.ColourFor(i, n); }
         Color GitLight(int i, int n) { return s.HueColorGit.IsEmpty ? core.ColourFor(i, n) : s.HueColorGit; }
@@ -993,6 +1207,9 @@ namespace MatrixBG
         {
             s = settings;
             Lights = new Hue(s);
+            MidiCtl = new Midi(s);
+            if (s.MidiEnabled && s.MidiPort.Length > 0 && !MidiCtl.Open(s.MidiPort))
+                Program.Log("midi: " + MidiCtl.LastError);
             Rectangle vs = SystemInformation.VirtualScreen;
             core = new RainCore(Program.WindowMode ? 1280 : vs.Width, Program.WindowMode ? 720 : vs.Height, s);
             if (Program.WindowMode) { test = new TestWindow(core); test.Closed += delegate { Application.Exit(); }; }
@@ -1013,6 +1230,27 @@ namespace MatrixBG
         {
             try
             {
+                // MIDI: consume queued events and publish overrides on the UI thread.
+                // Runs before the pause gate so an overlay toggle works while paused.
+                if (s.MidiEnabled)
+                {
+                    if ((MidiCtl.TakeOverlayToggles() & 1) == 1) { if (SaverActive) HideSaver(); else ShowSaver(); }
+                    int burst = MidiCtl.TakeBursts();
+                    if (burst > 0) core.Burst(Math.Min(burst, 80));
+                    if (MidiCtl.TakeBeat()) core.BeatPulse = 1f;
+                    core.MidiSpeedMul = MidiCtl.CcSpeed >= 0 ? 0.35f + (2.3f - 0.35f) * MidiCtl.CcSpeed / 127f : -1f;
+                    core.MidiDensity = MidiCtl.CcDensity >= 0 ? MidiCtl.CcDensity / 127f : -1f;
+                    core.MidiHue = MidiCtl.CcHue >= 0 ? MidiCtl.CcHue * 360f / 127f : -1f;
+                    core.MidiBlendT = MidiCtl.CcBlend >= 0 ? MidiCtl.CcBlend / 127f : -1f;
+                    core.MidiTail = MidiCtl.CcTail >= 0 ? MidiCtl.CcTail / 127f : -1f;
+                    core.MidiDim = MidiCtl.CcDim >= 0 ? MidiCtl.CcDim / 127f : -1f;
+                }
+                else if (core.MidiSpeedMul >= 0f || core.MidiHue >= 0f || core.MidiDensity >= 0f
+                         || core.MidiBlendT >= 0f || core.MidiTail >= 0f || core.MidiDim >= 0f)
+                {
+                    core.MidiSpeedMul = core.MidiDensity = core.MidiHue = core.MidiBlendT = core.MidiTail = core.MidiDim = -1f;
+                }
+
                 if (EffectivelyPaused) return;
                 // Nothing is looking at the buffer -> don't burn CPU.
                 if (!Program.WindowMode && !BackgroundOn && !SaverActive) return;
@@ -1176,6 +1414,7 @@ namespace MatrixBG
             if (saver != null) saver.Destroy();
             if (wall != null) wall.Destroy();
             if (test != null) test.Destroy();
+            MidiCtl.Dispose();   // first: no late driver callback may publish into a dying engine
             Lights.Dispose();
             audio.Dispose();
             core.Dispose();
@@ -1192,6 +1431,7 @@ namespace MatrixBG
         ToolStripMenuItem miPause, miWallpaper, miSaverStart, miSaverStop, miSaverOnIdle, miGit, miRainbow, miVideo, miFullscreen, miKeepAwake, miAutostart;
         ToolStripMenuItem mIdle, mColor, mMore, mColor2, mBlend, mSpeed, mDensity, mTail, mFlicker, mSize, mChars;
         ToolStripMenuItem mHue, miHueEnabled, miHueBg, miHuePair, mHueLights, miHueTest;
+        ToolStripMenuItem mMidi, miMidiEnabled, mMidiPort, miMidiStatus;
 
         // Green family first (all tuned around the classic matrix phosphor), other hues under "More colours".
         static readonly object[,] GREENS = {
@@ -1337,6 +1577,54 @@ namespace MatrixBG
             mHue.DropDownItems.Add(miHuePair); mHue.DropDownItems.Add(mHueLights); mHue.DropDownItems.Add(miHueTest);
             mHueLights.DropDownOpening += delegate { LoadHueLights(); };
             menu.Items.Add(mHue);
+
+            // --- MIDI control
+            mMidi = new ToolStripMenuItem("MIDI control (APC / Traktor / loopMIDI)");
+            miMidiEnabled = new ToolStripMenuItem("Enable MIDI control", null, delegate
+            {
+                s.MidiEnabled = !s.MidiEnabled;
+                if (s.MidiEnabled) { if (s.MidiPort.Length > 0 && !engine.MidiCtl.Open(s.MidiPort)) { } }
+                else engine.MidiCtl.Close();
+                Changed();
+            });
+            mMidiPort = new ToolStripMenuItem("Input port");
+            mMidiPort.DropDownOpening += delegate
+            {
+                mMidiPort.DropDownItems.Clear();
+                string[] ports = engine.MidiCtl.Ports();
+                if (ports.Length == 0)
+                {
+                    ToolStripMenuItem none = new ToolStripMenuItem("No MIDI input devices (install loopMIDI for a virtual port)");
+                    none.Enabled = false;
+                    mMidiPort.DropDownItems.Add(none);
+                    return;
+                }
+                foreach (string p in ports)
+                {
+                    string name = p;
+                    ToolStripMenuItem mi = new ToolStripMenuItem(name, null, delegate
+                    {
+                        s.MidiPort = name;
+                        if (s.MidiEnabled) engine.MidiCtl.Open(name);
+                        Changed();
+                    });
+                    mi.Checked = name == s.MidiPort;
+                    mMidiPort.DropDownItems.Add(mi);
+                }
+            };
+            miMidiStatus = new ToolStripMenuItem("");
+            miMidiStatus.Enabled = false;
+            mMidi.DropDownItems.Add(miMidiEnabled); mMidi.DropDownItems.Add(mMidiPort); mMidi.DropDownItems.Add(miMidiStatus);
+            mMidi.DropDownItems.Add(new ToolStripMenuItem("Mapping...", null, delegate
+            {
+                MessageBox.Show(
+                    "Default MIDI map (channel " + (s.MidiChannel == 0 ? "any" : s.MidiChannel.ToString()) + "; midichannel= in settings.txt):\n\n" +
+                    "CC 20   Speed\nCC 21   Density\nCC 22   Hue (replaces colour A; overrides rainbow)\nCC 23   Blend position (with a two-colour blend)\nCC 24   Tail length\nCC 25   Brightness\n\n" +
+                    "Any Note On   burst of drops (velocity = size)\nNote 36 (C1)   toggle the fullscreen overlay\nMIDI clock   beat pulse every quarter note\n\n" +
+                    "Tip: give MatrixBG its own loopMIDI port so a Traktor/APC mapping never collides with another app.",
+                    "MatrixBG MIDI", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }));
+            menu.Items.Add(mMidi);
             menu.Items.Add(new ToolStripMenuItem("Open settings folder", null, delegate { try { Directory.CreateDirectory(Settings.Dir); Process.Start("explorer.exe", Settings.Dir); } catch { } }));
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(new ToolStripMenuItem("About MatrixBG...", null, delegate { About(); }));
@@ -1400,6 +1688,11 @@ namespace MatrixBG
             miHueEnabled.Checked = s.HueEnabled;
             miHueBg.Checked = s.HueOnBackground;
             miHuePair.Text = engine.Lights.Paired ? "Re-pair with bridge...  (paired: " + s.HueIp + ")" : "Pair with bridge...";
+            miMidiEnabled.Checked = s.MidiEnabled;
+            miMidiStatus.Text = !s.MidiEnabled ? "MIDI off"
+                : engine.MidiCtl.OpenPortName.Length > 0 ? "Listening on " + engine.MidiCtl.OpenPortName
+                : engine.MidiCtl.LastError.Length > 0 ? "Error: " + engine.MidiCtl.LastError
+                : "Pick an input port";
             mHueLights.Enabled = engine.Lights.Paired; miHueTest.Enabled = engine.Lights.Paired;
             foreach (ToolStripItem it in mIdle.DropDownItems)
             {
