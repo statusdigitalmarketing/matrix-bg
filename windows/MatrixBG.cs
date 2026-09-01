@@ -35,7 +35,15 @@ namespace MatrixBG
         public bool Wallpaper = true;          // render behind the desktop icons
         public bool SaverOnIdle = true;        // pop a fullscreen saver after IdleSeconds of no input
         public int IdleSeconds = 120;
-        public bool GitTrigger = true;         // show the overlay while a git command is running
+        public bool GitTrigger = true;         // show the background while a git command is running
+        // Philips Hue
+        public bool HueEnabled = false;
+        public bool HueOnBackground = true;    // also run the light effect for the git-triggered background
+        public Color HueColorGit = Color.FromArgb(150, 0, 255);    // lights while git/background trigger is active
+        public Color HueColorIdle = Color.FromArgb(0, 90, 255);    // lights while the overlay is up
+        public string HueIp = "";
+        public string HueUser = "";
+        public string HueLights = "";          // comma-separated light ids; empty = all colour lights
         public bool PauseOnVideo = true;       // audio is playing -> pause wallpaper, don't start saver
         public bool PauseWhenFullscreen = true;
         public bool KeepAwake = false;
@@ -73,6 +81,13 @@ namespace MatrixBG
                         case "tail": if (isInt) s.Tail = Clamp(n, 0, 5); break;
                         case "flicker": if (isInt) s.Flicker = Clamp(n, 0, 3); break;
                         case "gittrigger": s.GitTrigger = v == "1"; break;
+                        case "hueenabled": s.HueEnabled = v == "1"; break;
+                        case "hueonbackground": s.HueOnBackground = v == "1"; break;
+                        case "hueip": s.HueIp = v; break;
+                        case "hueuser": s.HueUser = v; break;
+                        case "huelights": s.HueLights = v; break;
+                        case "huecolorgit": if (isInt) s.HueColorGit = n == 0 ? Color.Empty : Color.FromArgb(n); break;
+                        case "huecoloridle": if (isInt) s.HueColorIdle = n == 0 ? Color.Empty : Color.FromArgb(n); break;
                         case "fontsize": if (isInt) s.FontSize = Clamp(n, 0, 4); break;
                         case "charset": if (isInt) s.Charset = Clamp(n, 0, 3); break;
                         case "paused": s.Paused = v == "1"; break;
@@ -106,6 +121,13 @@ namespace MatrixBG
                 sb.AppendLine("tail=" + Tail);
                 sb.AppendLine("flicker=" + Flicker);
                 sb.AppendLine("gittrigger=" + B(GitTrigger));
+                sb.AppendLine("hueenabled=" + B(HueEnabled));
+                sb.AppendLine("hueonbackground=" + B(HueOnBackground));
+                sb.AppendLine("hueip=" + HueIp);
+                sb.AppendLine("hueuser=" + HueUser);
+                sb.AppendLine("huelights=" + HueLights);
+                sb.AppendLine("huecolorgit=" + HueColorGit.ToArgb());
+                sb.AppendLine("huecoloridle=" + HueColorIdle.ToArgb());
                 sb.AppendLine("fontsize=" + FontSize);
                 sb.AppendLine("charset=" + Charset);
                 sb.AppendLine("paused=" + B(Paused));
@@ -149,6 +171,16 @@ namespace MatrixBG
         [DllImport("user32.dll")] public static extern IntPtr SetCursor(IntPtr cursor);
         [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO info);
         [DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint flags);
+        [DllImport("kernel32.dll")] public static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern bool Process32First(IntPtr snap, ref PROCESSENTRY32 pe);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern bool Process32Next(IntPtr snap, ref PROCESSENTRY32 pe);
+        [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct PROCESSENTRY32
+        {
+            public uint dwSize, cntUsage, th32ProcessID; public IntPtr th32DefaultHeapID; public uint th32ModuleID, cntThreads, th32ParentProcessID; public int pcPriClassBase; public uint dwFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szExeFile;
+        }
         [DllImport("shell32.dll")] public static extern int SHQueryUserNotificationState(out int state);
         [DllImport("gdi32.dll")] public static extern IntPtr CreateCompatibleDC(IntPtr hdc);
         [DllImport("gdi32.dll")] public static extern IntPtr CreateDIBSection(IntPtr hdc, ref BITMAPINFO bmi, uint usage, out IntPtr bits, IntPtr section, uint offset);
@@ -402,6 +434,22 @@ namespace MatrixBG
         }
 
         public Color CurrentColor() { return s.Rainbow ? FromHsv(hue, 1f, 1f) : s.Color; }
+
+        // Colour the rain would use for "slot" i of n (used to give each Hue bulb its own place in a blend).
+        public Color ColourFor(int i, int n)
+        {
+            if (s.Rainbow) return FromHsv(hue + (n > 1 ? 360f * i / n : 0f), 1f, 1f);
+            if (s.Blend == 0) return s.Color;
+            float t;
+            switch (s.Blend)
+            {
+                case 1: t = (float)(Math.Sin(blendPhase) * 0.5 + 0.5); break;
+                case 2: case 3: t = n > 1 ? (float)i / (n - 1) : 0f; break;
+                case 4: t = (float)new Random(i * 7919 + 13).NextDouble(); break;
+                default: { float ph = (float)(((i / (float)Math.Max(1, n)) + blendPhase / (2 * Math.PI)) % 1.0); t = ph < 0.5f ? ph * 2f : 2f - ph * 2f; break; }
+            }
+            return Lerp(s.Color, s.Color2, t);
+        }
 
         static Color FromHsv(float h, float sat, float v)
         {
@@ -714,6 +762,202 @@ namespace MatrixBG
         }
     }
 
+    // ------------------------------------------------------------------ Philips Hue (local bridge API v1, no cloud)
+    // Captures the chosen lights, runs a "matrix" effect (rain colour, slow pulse, random flickers) while active,
+    // restores the captured state when stopped. All HTTP runs on a worker thread.
+    class Hue : IDisposable
+    {
+        public class Light { public string Id, Name; public bool On, Colour; public int Bri; public double X, Y; public int Ct; public string Mode; }
+
+        readonly Settings s;
+        readonly System.Web.Script.Serialization.JavaScriptSerializer json = new System.Web.Script.Serialization.JavaScriptSerializer();
+        readonly Random rnd = new Random();
+        readonly object gate = new object();
+        List<Light> active = new List<Light>();
+        Thread worker;
+        volatile bool running = false;
+        volatile int gen = 0;   // session stamp; written only on the UI thread
+        Func<int, int, Color> colourSource;   // (bulb index, bulb count) -> colour
+
+        public Hue(Settings settings) { s = settings; }
+        public bool Paired { get { return s.HueIp.Length > 0 && s.HueUser.Length > 0; } }
+        public bool Active { get { return running; } }
+        public string LastError = "";
+
+        string Url(string path) { return "http://" + s.HueIp + "/api/" + s.HueUser + path; }
+
+        string Http(string method, string url, string body)
+        {
+            System.Net.HttpWebRequest req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+            req.Method = method; req.Timeout = 4000; req.Proxy = null;
+            if (body != null)
+            {
+                byte[] data = Encoding.UTF8.GetBytes(body);
+                req.ContentType = "application/json"; req.ContentLength = data.Length;
+                using (Stream st = req.GetRequestStream()) st.Write(data, 0, data.Length);
+            }
+            using (System.Net.WebResponse resp = req.GetResponse())
+            using (StreamReader rd = new StreamReader(resp.GetResponseStream()))
+                return rd.ReadToEnd();
+        }
+
+        // Pair: POST /api with devicetype. Succeeds only while the bridge's link button was pressed (< 30 s ago).
+        public bool TryPair(string ip, out string message)
+        {
+            try
+            {
+                string r = Http("POST", "http://" + ip + "/api", "{\"devicetype\":\"matrixbg#" + Environment.MachineName + "\"}");
+                object[] arr = json.Deserialize<object[]>(r);
+                Dictionary<string, object> first = arr.Length > 0 ? arr[0] as Dictionary<string, object> : null;
+                if (first != null && first.ContainsKey("success"))
+                {
+                    Dictionary<string, object> ok = (Dictionary<string, object>)first["success"];
+                    s.HueIp = ip; s.HueUser = (string)ok["username"]; s.Save();
+                    message = "Paired with the bridge at " + ip + ".";
+                    return true;
+                }
+                if (first != null && first.ContainsKey("error"))
+                {
+                    Dictionary<string, object> err = (Dictionary<string, object>)first["error"];
+                    message = err.ContainsKey("description") ? (string)err["description"] : "bridge error";
+                    return false;
+                }
+                message = "Unexpected reply: " + r; return false;
+            }
+            catch (Exception ex) { message = ex.Message; return false; }
+        }
+
+        public static string Discover()
+        {
+            try
+            {
+                System.Net.HttpWebRequest req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create("https://discovery.meethue.com/");
+                req.Timeout = 6000;
+                using (System.Net.WebResponse resp = req.GetResponse())
+                using (StreamReader rd = new StreamReader(resp.GetResponseStream()))
+                {
+                    string r = rd.ReadToEnd();
+                    System.Text.RegularExpressions.Match m = System.Text.RegularExpressions.Regex.Match(r, "\"internalipaddress\"\\s*:\\s*\"([^\"]+)\"");
+                    return m.Success ? m.Groups[1].Value : "";
+                }
+            }
+            catch { return ""; }
+        }
+
+        public List<Light> GetLights()
+        {
+            List<Light> list = new List<Light>();
+            if (!Paired) return list;
+            try
+            {
+                Dictionary<string, object> all = json.Deserialize<Dictionary<string, object>>(Http("GET", Url("/lights"), null));
+                foreach (KeyValuePair<string, object> kv in all)
+                {
+                    // One malformed entry must not abort the enumeration (that would break
+                    // capture/restore for every light after it), and ids go straight into the
+                    // request path, so only accept the numeric ids the v1 API actually uses.
+                    try
+                    {
+                        if (!System.Text.RegularExpressions.Regex.IsMatch(kv.Key, "^[0-9]+$")) continue;
+                        Dictionary<string, object> l = kv.Value as Dictionary<string, object>;
+                        if (l == null || !l.ContainsKey("state")) continue;
+                        Dictionary<string, object> st = l["state"] as Dictionary<string, object>;
+                        if (st == null) continue;
+                        Light L = new Light(); L.Id = kv.Key; L.Name = l.ContainsKey("name") ? Convert.ToString(l["name"]) : kv.Key;
+                        L.On = st.ContainsKey("on") && (bool)st["on"];
+                        L.Bri = st.ContainsKey("bri") ? Convert.ToInt32(st["bri"]) : 254;
+                        L.Mode = st.ContainsKey("colormode") ? Convert.ToString(st["colormode"]) : "";
+                        L.Colour = st.ContainsKey("xy");
+                        if (L.Colour) { System.Collections.IList xy = (System.Collections.IList)st["xy"]; L.X = Convert.ToDouble(xy[0]); L.Y = Convert.ToDouble(xy[1]); }
+                        if (st.ContainsKey("ct")) L.Ct = Convert.ToInt32(st["ct"]);
+                        list.Add(L);
+                    }
+                    catch (Exception ex) { Program.Log("hue: skipped malformed light entry: " + ex.Message); }
+                }
+                LastError = "";
+            }
+            catch (Exception ex) { LastError = ex.Message; }
+            return list;
+        }
+
+        // RGB -> CIE xy (Philips' reference conversion).
+        public static void ToXY(Color c, out double x, out double y)
+        {
+            double r = Gamma(c.R / 255.0), g = Gamma(c.G / 255.0), b = Gamma(c.B / 255.0);
+            double X = r * 0.4124 + g * 0.3576 + b * 0.1805, Y = r * 0.2126 + g * 0.7152 + b * 0.0722, Z = r * 0.0193 + g * 0.1192 + b * 0.9505;
+            double sum = X + Y + Z;
+            if (sum <= 0) { x = 0.3127; y = 0.3290; return; }
+            x = X / sum; y = Y / sum;
+        }
+        static double Gamma(double v) { return v > 0.04045 ? Math.Pow((v + 0.055) / 1.055, 2.4) : v / 12.92; }
+
+        public void Start(Func<int, int, Color> colour)
+        {
+            if (!s.HueEnabled || !Paired) return;
+            if (running) { colourSource = colour; return; }   // already running: just switch colour live
+            // A previous worker may still be restoring bulb state; let it finish before the
+            // new session captures "previous state", or it captures mid-restore effect colours.
+            // If it is genuinely stuck (bridge timing out per light), do NOT start a rival
+            // session: the old worker still owns the lights and restores when it unsticks.
+            // Sessions are generation-stamped so a zombie can never resume its effect loop
+            // after a newer session exists. gen is only written on the UI thread.
+            if (worker != null && worker.IsAlive) { worker.Join(3000); if (worker.IsAlive) return; }
+            colourSource = colour;
+            running = true;
+            gen++;
+            int myGen = gen;
+            worker = new Thread(delegate() { Run(myGen); }); worker.IsBackground = true; worker.Start();
+        }
+
+        public void Stop()
+        {
+            running = false;
+        }
+
+        void Run(int myGen)
+        {
+            List<Light> lights;
+            try
+            {
+                lights = GetLights();
+                HashSet<string> chosen = new HashSet<string>(s.HueLights.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries));
+                lights.RemoveAll(delegate(Light l) { return !l.Colour || (chosen.Count > 0 && !chosen.Contains(l.Id)); });
+                lock (gate) active = lights;
+                Program.Log("hue: effect on " + lights.Count + " lights");
+                double phase = 0;
+                while (running && gen == myGen)
+                {
+                    phase += 0.35;
+                    int idx = 0;
+                    foreach (Light l in lights)
+                    {
+                        if (!running || gen != myGen) break;
+                        Color c = colourSource(idx++, lights.Count);
+                        double x, y; ToXY(c, out x, out y);
+                        int bri = (int)(150 + 100 * Math.Sin(phase + l.Id.GetHashCode() % 7));
+                        bool flick = rnd.Next(6) == 0;
+                        if (flick) bri = rnd.Next(20, 80);
+                        string body = "{\"on\":true,\"xy\":[" + x.ToString("0.0000", System.Globalization.CultureInfo.InvariantCulture) + "," + y.ToString("0.0000", System.Globalization.CultureInfo.InvariantCulture) + "],\"bri\":" + Math.Max(1, Math.Min(254, bri)) + ",\"transitiontime\":" + (flick ? 0 : 4) + "}";
+                        try { Http("PUT", Url("/lights/" + l.Id + "/state"), body); } catch (Exception ex) { LastError = ex.Message; }
+                    }
+                    Thread.Sleep(500);   // ~2 updates/s per light keeps well under the bridge's rate limit
+                }
+            }
+            catch (Exception ex) { LastError = ex.Message; Program.Log("hue: " + ex.Message); lights = active; }
+            // restore
+            foreach (Light l in lights)
+            {
+                string body = l.On
+                    ? "{\"on\":true,\"bri\":" + l.Bri + (l.Mode == "ct" && l.Ct > 0 ? ",\"ct\":" + l.Ct : ",\"xy\":[" + l.X.ToString("0.0000", System.Globalization.CultureInfo.InvariantCulture) + "," + l.Y.ToString("0.0000", System.Globalization.CultureInfo.InvariantCulture) + "]") + ",\"transitiontime\":10}"
+                    : "{\"on\":false,\"transitiontime\":10}";
+                try { Http("PUT", Url("/lights/" + l.Id + "/state"), body); } catch (Exception ex) { LastError = ex.Message; }
+            }
+            Program.Log("hue: restored " + lights.Count + " lights");
+        }
+
+        public void Dispose() { running = false; gen++; if (worker != null && worker.IsAlive) worker.Join(10000); }   // long join: quitting must not strand the lights mid-effect
+    }
+
     // ------------------------------------------------------------------ engine: timers, idle/saver logic, pause rules
     class Engine : IDisposable
     {
@@ -723,15 +967,19 @@ namespace MatrixBG
         readonly SaverWindow saver;
         readonly TestWindow test;
         readonly AudioMeter audio = new AudioMeter();
+        public readonly Hue Lights;
+        public Color RainColour() { return core.CurrentColor(); }
+        public Color RainColourFor(int i, int n) { return core.ColourFor(i, n); }
+        Color GitLight(int i, int n) { return s.HueColorGit.IsEmpty ? core.ColourFor(i, n) : s.HueColorGit; }
+        Color IdleLight(int i, int n) { return s.HueColorIdle.IsEmpty ? core.ColourFor(i, n) : s.HueColorIdle; }
         readonly System.Windows.Forms.Timer tick = new System.Windows.Forms.Timer();
         readonly System.Windows.Forms.Timer poll = new System.Windows.Forms.Timer();
         int pollTicks = 0, audioHits = 0;
         float secPeak = 0f;
         // git trigger state
-        bool gitRunning = false, gitSuppressed = false, saverForGit = false;
-        int gitQuietPolls = 0;
-        uint gitShownTick = 0;
-        const uint GIT_MAX_MS = 30000;     // safety cap: never hold the overlay longer than this for one git run
+        bool gitRunning = false, gitWallpaper = false, gitLights = false;   // gitWallpaper: background exists only because git is running
+        int gitQuietPolls = 99;     // starts "quiet" so the grace window doesn't fire at startup
+        bool BackgroundOn { get { return s.Wallpaper || gitWallpaper; } }
         uint saverShownInput = 0;
         readonly uint startTick = unchecked((uint)Environment.TickCount);
         bool fullscreenApp = false;
@@ -744,6 +992,7 @@ namespace MatrixBG
         public Engine(Settings settings)
         {
             s = settings;
+            Lights = new Hue(s);
             Rectangle vs = SystemInformation.VirtualScreen;
             core = new RainCore(Program.WindowMode ? 1280 : vs.Width, Program.WindowMode ? 720 : vs.Height, s);
             if (Program.WindowMode) { test = new TestWindow(core); test.Closed += delegate { Application.Exit(); }; }
@@ -756,6 +1005,7 @@ namespace MatrixBG
             tick.Interval = 33; tick.Tick += OnTick; tick.Start();
             poll.Interval = 250; poll.Tick += OnPoll; poll.Start();   // idle/input/audio/fullscreen checks
             ApplyKeepAwake();
+            if (s.Wallpaper && s.HueOnBackground) Lights.Start(GitLight);   // permanent background -> lights follow it
             if (Program.StartSaver) ShowSaver();
         }
 
@@ -765,11 +1015,11 @@ namespace MatrixBG
             {
                 if (EffectivelyPaused) return;
                 // Nothing is looking at the buffer -> don't burn CPU.
-                if (!Program.WindowMode && !s.Wallpaper && !SaverActive) return;
+                if (!Program.WindowMode && !BackgroundOn && !SaverActive) return;
                 core.Step();
                 Program.Frames++;
                 if (test != null) test.Present();
-                if (wall != null && s.Wallpaper) wall.Present();
+                if (wall != null && BackgroundOn) wall.Present();
                 if (saver != null && saver.Visible) saver.Present();
             }
             catch (Exception ex) { Program.Log("tick error: " + ex); }
@@ -783,7 +1033,11 @@ namespace MatrixBG
                 uint rawIdle = Native.IdleMs();
                 uint lastInput = unchecked((uint)Environment.TickCount - rawIdle);
                 // Dismiss the saver on any input after it appeared.
-                if (SaverActive && unchecked(lastInput - saverShownInput) > 400 && rawIdle < 1000) { HideSaver(); return; }
+                if (SaverActive && unchecked(lastInput - saverShownInput) > 400 && rawIdle < 1000)
+                {
+                    Program.Log("saver dismissed by input: rawIdle=" + rawIdle + "ms sinceShownInput=" + unchecked(lastInput - saverShownInput) + "ms");
+                    HideSaver(); return;
+                }
 
                 // For triggering, idle counts from app start (otherwise launching on an already-idle machine pops the overlay instantly).
                 uint idle = rawIdle;
@@ -801,44 +1055,69 @@ namespace MatrixBG
                     secPeak = 0f;
                     fullscreenApp = s.PauseWhenFullscreen && Native.IsFullscreenAppActive();
                     OnDisplayChange();   // no-op unless the virtual screen size changed
-                    if (wall != null && s.Wallpaper && pollTicks % 12 == 0) wall.Watch();
+                    if (wall != null && BackgroundOn && pollTicks % 12 == 0) wall.Watch();
                 }
 
                 if (!SaverActive && s.SaverOnIdle && !Program.WindowMode && idle >= (uint)s.IdleSeconds * 1000u
                     && !(s.PauseOnVideo && VideoPlaying) && !fullscreenApp)
                     ShowSaver(false);
 
-                // --- git trigger: overlay while any git.exe is running (checked every 500 ms).
-                if (pollTicks % 2 == 0 && !Program.WindowMode)
+                // --- git trigger: background rain (behind the icons) while any git.exe is running (checked every 500 ms).
+                // Only matters when the background is otherwise off; it is created for the duration and removed afterwards.
+                if (pollTicks % 2 == 0 && !Program.WindowMode && wall != null)
                 {
                     bool running = s.GitTrigger && IsProcessRunning("git");
+                    if (Program.Debug && (running || gitRunning)) Program.Log("git poll: running=" + running + " quiet=" + gitQuietPolls + " bg=" + gitWallpaper);
                     if (running) gitQuietPolls = 0; else gitQuietPolls++;
-                    gitRunning = running || gitQuietPolls < 2;            // ~1 s grace so chained git calls don't flap
-                    if (!gitRunning) gitSuppressed = false;               // user dismissed it: stay down until git is done
-                    uint now = unchecked((uint)Environment.TickCount);
-                    if (gitRunning && !SaverActive && !gitSuppressed && !fullscreenApp) { saverForGit = true; gitShownTick = now; ShowSaver(true); }
-                    else if (saverForGit && SaverActive && (!gitRunning || unchecked(now - gitShownTick) > GIT_MAX_MS)) { HideSaver(); if (gitRunning) gitSuppressed = true; }
+                    gitRunning = running || gitQuietPolls < 3;            // ~1.5 s grace so chained git calls don't flap
+                    // lights: react to git whether or not the background is already on
+                    if (gitRunning && !gitLights) { gitLights = true; if (s.HueOnBackground && !SaverActive) Lights.Start(GitLight); Program.Log("git: lights on"); }
+                    else if (!gitRunning && gitLights) { gitLights = false; if (!SaverActive && !(s.Wallpaper && s.HueOnBackground)) Lights.Stop(); Program.Log("git: lights off"); }
+                    // background: only needed when it is otherwise off
+                    if (gitRunning && !s.Wallpaper && !gitWallpaper)
+                    {
+                        Program.Log("git: background on");
+                        gitWallpaper = true;
+                        try { wall.Create(); core.Clear(); } catch (Exception ex) { Program.Log("git wallpaper failed: " + ex.Message); gitWallpaper = false; }
+                    }
+                    else if (gitWallpaper && (!gitRunning || s.Wallpaper))
+                    {
+                        Program.Log("git: background off");
+                        gitWallpaper = false;
+                        if (!s.Wallpaper) wall.Destroy();
+                    }
                 }
             }
             catch (Exception ex) { Program.Log("poll error: " + ex); }
         }
 
-        static bool IsProcessRunning(string name)
+        // Toolhelp snapshot walk. (Process.GetProcessesByName throws when a process disappears mid-enumeration,
+        // which happens constantly while git spawns helpers, so it kept reporting "not running".)
+        static bool IsProcessRunning(string exeName)
         {
-            Process[] ps = null;
-            try { ps = Process.GetProcessesByName(name); return ps.Length > 0; }
-            catch { return false; }
-            finally { if (ps != null) foreach (Process p in ps) p.Dispose(); }
+            string target = exeName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? exeName : exeName + ".exe";
+            IntPtr snap = Native.CreateToolhelp32Snapshot(2 /*TH32CS_SNAPPROCESS*/, 0);
+            if (snap == IntPtr.Zero || snap == new IntPtr(-1)) return false;
+            try
+            {
+                Native.PROCESSENTRY32 pe = new Native.PROCESSENTRY32();
+                pe.dwSize = (uint)Marshal.SizeOf(typeof(Native.PROCESSENTRY32));
+                if (!Native.Process32First(snap, ref pe)) return false;
+                do { if (string.Equals(pe.szExeFile, target, StringComparison.OrdinalIgnoreCase)) return true; }
+                while (Native.Process32Next(snap, ref pe));
+                return false;
+            }
+            finally { Native.CloseHandle(snap); }
         }
 
-        public void ShowSaver(bool forGit = false)
+        public void ShowSaver(bool unused = false)
         {
             if (saver == null || saver.Visible) return;
-            Program.Log("saver show" + (forGit ? " (git)" : ""));
-            saverForGit = forGit;
+            Program.Log("saver show");
             saverShownInput = unchecked((uint)Environment.TickCount - Native.IdleMs());
             if (!s.Wallpaper) core.Clear();
             saver.Show();
+            Lights.Start(IdleLight);   // overlay -> "idle" colour (blue by default); switches live if git already had them purple
             Notify();
         }
 
@@ -846,18 +1125,25 @@ namespace MatrixBG
         {
             if (saver == null || !saver.Visible) return;
             Program.Log("saver hide");
-            if (saverForGit && gitRunning) gitSuppressed = true;   // dismissed by input mid-git: don't re-pop for this run
-            saverForGit = false;
             saver.Hide();
-            Cursor.Show();
+            if ((gitLights || s.Wallpaper) && s.HueOnBackground) Lights.Start(GitLight);   // back to the background/git colour
+            else Lights.Stop();
             Notify();
         }
 
         public void ApplyWallpaper()
         {
             if (wall == null) return;
-            if (s.Wallpaper) { if (wall.Handle == IntPtr.Zero) wall.Create(); else wall.Reattach(); core.Clear(); }
-            else { wall.Destroy(); core.Clear(); }
+            if (s.Wallpaper) { if (wall.Handle == IntPtr.Zero) wall.Create(); else wall.Reattach(); core.Clear(); if (s.HueOnBackground && !SaverActive) Lights.Start(GitLight); }
+            else { wall.Destroy(); core.Clear(); if (!SaverActive && !gitLights) Lights.Stop(); }
+        }
+
+        // "Lights follow the background" toggled from the tray.
+        public void ApplyHueBackground()
+        {
+            if (SaverActive) return;
+            if (s.HueOnBackground && (s.Wallpaper || gitLights)) Lights.Start(GitLight);
+            else Lights.Stop();
         }
 
         public void ApplyKeepAwake()
@@ -875,7 +1161,7 @@ namespace MatrixBG
             try
             {
                 core.Resize(vs.Width, vs.Height);
-                if (wall != null && s.Wallpaper) wall.Reattach();
+                if (wall != null && BackgroundOn) wall.Reattach();   // covers the git-triggered background too
                 if (saver != null && saver.Visible) saver.Show();
             }
             catch (Exception ex) { Program.Log("display change failed: " + ex.Message); }
@@ -890,6 +1176,7 @@ namespace MatrixBG
             if (saver != null) saver.Destroy();
             if (wall != null) wall.Destroy();
             if (test != null) test.Destroy();
+            Lights.Dispose();
             audio.Dispose();
             core.Dispose();
         }
@@ -904,6 +1191,7 @@ namespace MatrixBG
         readonly ContextMenuStrip menu = new ContextMenuStrip();
         ToolStripMenuItem miPause, miWallpaper, miSaverStart, miSaverStop, miSaverOnIdle, miGit, miRainbow, miVideo, miFullscreen, miKeepAwake, miAutostart;
         ToolStripMenuItem mIdle, mColor, mMore, mColor2, mBlend, mSpeed, mDensity, mTail, mFlicker, mSize, mChars;
+        ToolStripMenuItem mHue, miHueEnabled, miHueBg, miHuePair, mHueLights, miHueTest;
 
         // Green family first (all tuned around the classic matrix phosphor), other hues under "More colours".
         static readonly object[,] GREENS = {
@@ -962,7 +1250,8 @@ namespace MatrixBG
             ToolStripMenuItem hBg = new ToolStripMenuItem("BACKGROUND  (behind desktop icons)"); hBg.Enabled = false;
             miWallpaper = new ToolStripMenuItem("Enable background rain", null, delegate { s.Wallpaper = !s.Wallpaper; engine.ApplyWallpaper(); Changed(); });
             miPause = new ToolStripMenuItem("Pause animation", null, delegate { TogglePause(); });
-            menu.Items.Add(hBg); menu.Items.Add(miWallpaper); menu.Items.Add(miPause);
+            miGit = new ToolStripMenuItem("Trigger: show background while a git command runs", null, delegate { s.GitTrigger = !s.GitTrigger; Changed(); });
+            menu.Items.Add(hBg); menu.Items.Add(miWallpaper); menu.Items.Add(miGit); menu.Items.Add(miPause);
             menu.Items.Add(new ToolStripSeparator());
 
             // --- overlay mode (fullscreen screensaver on top of everything)
@@ -978,8 +1267,7 @@ namespace MatrixBG
                 ToolStripMenuItem mi = new ToolStripMenuItem(IdleLabel(sec), null, delegate { s.IdleSeconds = v; Changed(); });
                 mi.Tag = v; mIdle.DropDownItems.Add(mi);
             }
-            miGit = new ToolStripMenuItem("Trigger: while a git command runs", null, delegate { s.GitTrigger = !s.GitTrigger; Changed(); });
-            menu.Items.Add(miSaverStart); menu.Items.Add(miSaverStop); menu.Items.Add(miSaverOnIdle); menu.Items.Add(mIdle); menu.Items.Add(miGit);
+            menu.Items.Add(miSaverStart); menu.Items.Add(miSaverStop); menu.Items.Add(miSaverOnIdle); menu.Items.Add(mIdle);
             menu.Items.Add(new ToolStripSeparator());
 
             // --- settings
@@ -1021,6 +1309,34 @@ namespace MatrixBG
             miKeepAwake = new ToolStripMenuItem("Keep awake (no sleep / display off)", null, delegate { s.KeepAwake = !s.KeepAwake; engine.ApplyKeepAwake(); Changed(); });
             miAutostart = new ToolStripMenuItem("Launch at login", null, delegate { s.Autostart = !s.Autostart; ApplyAutostart(); Changed(); });
             menu.Items.Add(miVideo); menu.Items.Add(miFullscreen); menu.Items.Add(miKeepAwake); menu.Items.Add(miAutostart);
+
+            // --- Philips Hue
+            mHue = new ToolStripMenuItem("Philips Hue lights");
+            miHueEnabled = new ToolStripMenuItem("Enable light effects", null, delegate { s.HueEnabled = !s.HueEnabled; if (!s.HueEnabled) engine.Lights.Stop(); Changed(); });
+            miHueBg = new ToolStripMenuItem("Lights follow the background too (permanent or git-triggered)", null, delegate { s.HueOnBackground = !s.HueOnBackground; engine.ApplyHueBackground(); Changed(); });
+            miHuePair = new ToolStripMenuItem("Pair with bridge...", null, delegate { PairHue(); });
+            mHueLights = new ToolStripMenuItem("Lights to use");
+            miHueTest = new ToolStripMenuItem("Test lights (5 s)", null, delegate { TestHue(); });
+            ToolStripMenuItem mHueGit = new ToolStripMenuItem("Light colour: git / background");
+            ToolStripMenuItem mHueIdle = new ToolStripMenuItem("Light colour: overlay (idle)");
+            object[,] LIGHTCOLS = {
+                { "Purple",  Color.FromArgb(150, 0, 255) }, { "Blue", Color.FromArgb(0, 90, 255) }, { "Matrix Green", Color.FromArgb(0, 255, 70) },
+                { "Cyan", Color.FromArgb(0, 230, 255) }, { "Red", Color.FromArgb(255, 30, 30) }, { "Amber", Color.FromArgb(255, 176, 0) },
+                { "Pink", Color.FromArgb(255, 50, 170) }, { "White", Color.FromArgb(255, 255, 255) } };
+            for (int i = 0; i < LIGHTCOLS.GetLength(0); i++)
+            {
+                string nm = (string)LIGHTCOLS[i, 0]; Color c = (Color)LIGHTCOLS[i, 1];
+                ToolStripMenuItem a = new ToolStripMenuItem(nm, Swatch(c), delegate { s.HueColorGit = c; Changed(); }); a.Tag = c; mHueGit.DropDownItems.Add(a);
+                ToolStripMenuItem b = new ToolStripMenuItem(nm, Swatch(c), delegate { s.HueColorIdle = c; Changed(); }); b.Tag = c; mHueIdle.DropDownItems.Add(b);
+            }
+            mHueGit.DropDownItems.Add(new ToolStripMenuItem("Match the rain exactly (each bulb takes its place in the blend)", null, delegate { s.HueColorGit = Color.Empty; Changed(); }));
+            mHueIdle.DropDownItems.Add(new ToolStripMenuItem("Match the rain exactly (each bulb takes its place in the blend)", null, delegate { s.HueColorIdle = Color.Empty; Changed(); }));
+            mHueGit.DropDownOpening += delegate { foreach (ToolStripItem it in mHueGit.DropDownItems) { ToolStripMenuItem mi = it as ToolStripMenuItem; if (mi != null) mi.Checked = mi.Tag is Color ? ((Color)mi.Tag).ToArgb() == s.HueColorGit.ToArgb() : s.HueColorGit.IsEmpty; } };
+            mHueIdle.DropDownOpening += delegate { foreach (ToolStripItem it in mHueIdle.DropDownItems) { ToolStripMenuItem mi = it as ToolStripMenuItem; if (mi != null) mi.Checked = mi.Tag is Color ? ((Color)mi.Tag).ToArgb() == s.HueColorIdle.ToArgb() : s.HueColorIdle.IsEmpty; } };
+            mHue.DropDownItems.Add(miHueEnabled); mHue.DropDownItems.Add(miHueBg); mHue.DropDownItems.Add(mHueGit); mHue.DropDownItems.Add(mHueIdle); mHue.DropDownItems.Add(new ToolStripSeparator());
+            mHue.DropDownItems.Add(miHuePair); mHue.DropDownItems.Add(mHueLights); mHue.DropDownItems.Add(miHueTest);
+            mHueLights.DropDownOpening += delegate { LoadHueLights(); };
+            menu.Items.Add(mHue);
             menu.Items.Add(new ToolStripMenuItem("Open settings folder", null, delegate { try { Directory.CreateDirectory(Settings.Dir); Process.Start("explorer.exe", Settings.Dir); } catch { } }));
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(new ToolStripMenuItem("About MatrixBG...", null, delegate { About(); }));
@@ -1081,6 +1397,10 @@ namespace MatrixBG
             miFullscreen.Checked = s.PauseWhenFullscreen;
             miKeepAwake.Checked = s.KeepAwake;
             miAutostart.Checked = s.Autostart;
+            miHueEnabled.Checked = s.HueEnabled;
+            miHueBg.Checked = s.HueOnBackground;
+            miHuePair.Text = engine.Lights.Paired ? "Re-pair with bridge...  (paired: " + s.HueIp + ")" : "Pair with bridge...";
+            mHueLights.Enabled = engine.Lights.Paired; miHueTest.Enabled = engine.Lights.Paired;
             foreach (ToolStripItem it in mIdle.DropDownItems)
             {
                 ToolStripMenuItem mi = it as ToolStripMenuItem;
@@ -1192,6 +1512,71 @@ namespace MatrixBG
                 }
             }
             catch { }
+        }
+
+        // ---- Philips Hue helpers
+        // The whole flow (discovery GET, pairing retries with sleeps) runs off the UI thread:
+        // an unreachable bridge would otherwise freeze the tray for ~10 s of timeouts.
+        // MessageBoxes are fine on a worker thread (no owner window in a tray app); the
+        // settings/menu mutation on success is marshalled back via the captured UI context.
+        volatile bool pairing = false;   // volatile: set on the UI thread, cleared on the worker
+        void PairHue()
+        {
+            if (pairing) return;
+            pairing = true;
+            System.Threading.SynchronizationContext ui = System.Threading.SynchronizationContext.Current;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    string ip = Hue.Discover();
+                    if (ip.Length == 0) ip = s.HueIp;
+                    if (ip.Length == 0)
+                    {
+                        MessageBox.Show("No Hue bridge found on this network (discovery.meethue.com returned nothing).\nMake sure the bridge is on the same network and try again.", "Philips Hue", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        return;
+                    }
+                    if (MessageBox.Show("Bridge found at " + ip + ".\n\nPress the round link button on the bridge now, then click OK (within 30 seconds).", "Philips Hue", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK) return;
+                    string msg = ""; bool ok = false;
+                    for (int i = 0; i < 6 && !ok; i++) { ok = engine.Lights.TryPair(ip, out msg); if (!ok) Thread.Sleep(1500); }
+                    if (ok && ui != null) ui.Post(delegate(object _) { s.HueEnabled = true; Changed(); }, null);
+                    MessageBox.Show(ok ? msg + "\nLight effects are now enabled. Pick lights under \"Lights to use\" (default: all colour lights)." : "Pairing failed: " + msg, "Philips Hue", MessageBoxButtons.OK, ok ? MessageBoxIcon.Information : MessageBoxIcon.Error);
+                }
+                finally { pairing = false; }
+            });
+        }
+
+        void LoadHueLights()
+        {
+            mHueLights.DropDownItems.Clear();
+            List<Hue.Light> lights = engine.Lights.GetLights();
+            if (lights.Count == 0) { ToolStripMenuItem none = new ToolStripMenuItem(engine.Lights.LastError.Length > 0 ? "Bridge error: " + engine.Lights.LastError : "No lights found"); none.Enabled = false; mHueLights.DropDownItems.Add(none); return; }
+            HashSet<string> chosen = new HashSet<string>(s.HueLights.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries));
+            ToolStripMenuItem all = new ToolStripMenuItem("All colour lights", null, delegate { s.HueLights = ""; Changed(); });
+            all.Checked = chosen.Count == 0;
+            mHueLights.DropDownItems.Add(all); mHueLights.DropDownItems.Add(new ToolStripSeparator());
+            foreach (Hue.Light l in lights)
+            {
+                string id = l.Id;
+                ToolStripMenuItem mi = new ToolStripMenuItem(l.Name + (l.Colour ? "" : "  (no colour)"), null, delegate
+                {
+                    HashSet<string> set = new HashSet<string>(s.HueLights.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries));
+                    if (!set.Remove(id)) set.Add(id);
+                    s.HueLights = string.Join(",", new List<string>(set).ToArray()); Changed();
+                });
+                mi.Enabled = l.Colour; mi.Checked = chosen.Contains(id);
+                mHueLights.DropDownItems.Add(mi);
+            }
+        }
+
+        void TestHue()
+        {
+            bool was = s.HueEnabled; s.HueEnabled = true;
+            engine.Lights.Start(engine.RainColourFor);
+            s.HueEnabled = was;
+            System.Windows.Forms.Timer t = new System.Windows.Forms.Timer(); t.Interval = 5000;
+            t.Tick += delegate { t.Stop(); t.Dispose(); if (!engine.SaverActive) engine.Lights.Stop(); };
+            t.Start();
         }
 
         void About()

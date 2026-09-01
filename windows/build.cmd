@@ -14,6 +14,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$h=$b.GetHicon(); $i=[System.Drawing.Icon]::FromHandle($h); $fs=[IO.File]::Create('app.ico'); $i.Save($fs); $fs.Close()"
 
 "%CSC%" /nologo /target:winexe /optimize+ /unsafe /platform:anycpu /win32icon:app.ico /out:MatrixBG.exe ^
-  /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll MatrixBG.cs
+  /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Web.Extensions.dll MatrixBG.cs
 if errorlevel 1 (echo BUILD FAILED & exit /b 1)
 echo Built MatrixBG.exe
