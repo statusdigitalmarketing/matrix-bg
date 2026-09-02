@@ -7,7 +7,7 @@ WIN_SOURCE = matrix-bg-windows.c
 WIN_BINARY = matrix-bg.exe
 WIN_CC = x86_64-w64-mingw32-gcc
 
-.PHONY: build install app app-install windows clean
+.PHONY: build install app app-install windows sim-test prolink-test clean
 
 build:
 	swiftc -O -o $(BINARY) $(SOURCE) -framework AppKit -framework CoreText
@@ -31,6 +31,12 @@ windows:
 	$(WIN_CC) -O2 -Wall -Wextra -municode -mwindows $(WIN_SOURCE) -o $(WIN_BINARY) -lgdi32 -luser32
 	x86_64-w64-mingw32-strip $(WIN_BINARY)
 	@echo "Built $(WIN_BINARY)"
+
+# Runtime-test the CDJ listener: runs the REAL ProLink class from windows/MatrixBG.cs
+# under mono and fires synthetic Pro DJ Link beat packets at it over loopback.
+prolink-test:
+	cd windows && mcs -sdk:4.5 -unsafe -main:MatrixBG.ProLinkTest -r:System.dll -r:System.Drawing.dll -r:System.Windows.Forms.dll -r:System.Web.Extensions.dll -out:test/prolink-test.exe MatrixBG.cs test/prolink-test.cs
+	cd windows && mono test/prolink-test.exe
 
 # Prove the Windows port's simulation obeys the Swift app's rules: compiles the
 # shipped matrix-bg-windows.c natively via test/windows.h shims and executes it.

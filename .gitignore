@@ -25,3 +25,4 @@ matrix-bg.exe
 test/sim-parity-test
 test/.charset-*.txt
 windows/MatrixBG.exe
+windows/test/prolink-test.exe
