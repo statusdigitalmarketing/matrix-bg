@@ -49,6 +49,14 @@ Traktor) and enable. Default map, channel-agnostic unless `midichannel=` (1-16) 
 Overrides stay active until MIDI control is disabled. Tip: give MatrixBG its own loopMIDI port so an existing
 Traktor/APC mapping never collides with another app's use of the same controller.
 
+## CDJ beat sync (tray > CDJ beat sync)
+If Pioneer gear (CDJs/XDJs, or a mixer) is on the same network, enable this and the rain pulses on the beat:
+players broadcast a Pro DJ Link beat packet on UDP 50001 for every beat and MatrixBG **passively listens**. Nothing
+is ever transmitted. Options: pulse on every beat or downbeats only, and "Sync rain speed to deck BPM" (120 BPM =
+normal speed; a live MIDI speed CC always wins). Notes: Windows Firewall asks once to allow listening; if rekordbox
+runs on the same machine both bind UDP 50001 and Windows may deliver packets to only one of them; v1 hears ANY
+linked player (true tempo-master tracking is not implemented), so two decks playing at once both pulse the field.
+
 ## Command line
 - `--fullscreen` (or `--saver`) start the overlay immediately
 - `--window` run in a normal window (testing)

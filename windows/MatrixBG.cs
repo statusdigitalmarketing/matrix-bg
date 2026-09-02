@@ -48,6 +48,10 @@ namespace MatrixBG
         public bool MidiEnabled = false;
         public string MidiPort = "";           // input device name; "" = none chosen yet
         public int MidiChannel = 0;            // 0 = omni, 1-16 = only that channel
+        // CDJ beat sync (Pro DJ Link, passive listener)
+        public bool ProLinkEnabled = false;
+        public int ProLinkPulse = 1;           // 1 = every beat, 2 = downbeats only
+        public bool ProLinkBpmSync = false;    // map deck BPM to rain speed
         public bool PauseOnVideo = true;       // audio is playing -> pause wallpaper, don't start saver
         public bool PauseWhenFullscreen = true;
         public bool KeepAwake = false;
@@ -95,6 +99,9 @@ namespace MatrixBG
                         case "midienabled": s.MidiEnabled = v == "1"; break;
                         case "midiport": s.MidiPort = v; break;
                         case "midichannel": if (isInt) s.MidiChannel = Clamp(n, 0, 16); break;
+                        case "prolinkenabled": s.ProLinkEnabled = v == "1"; break;
+                        case "prolinkpulse": if (isInt) s.ProLinkPulse = Clamp(n, 1, 2); break;
+                        case "prolinkbpmsync": s.ProLinkBpmSync = v == "1"; break;
                         case "fontsize": if (isInt) s.FontSize = Clamp(n, 0, 4); break;
                         case "charset": if (isInt) s.Charset = Clamp(n, 0, 3); break;
                         case "paused": s.Paused = v == "1"; break;
@@ -138,6 +145,9 @@ namespace MatrixBG
                 sb.AppendLine("midienabled=" + B(MidiEnabled));
                 sb.AppendLine("midiport=" + MidiPort);
                 sb.AppendLine("midichannel=" + MidiChannel);
+                sb.AppendLine("prolinkenabled=" + B(ProLinkEnabled));
+                sb.AppendLine("prolinkpulse=" + ProLinkPulse);
+                sb.AppendLine("prolinkbpmsync=" + B(ProLinkBpmSync));
                 sb.AppendLine("fontsize=" + FontSize);
                 sb.AppendLine("charset=" + Charset);
                 sb.AppendLine("paused=" + B(Paused));
@@ -841,12 +851,14 @@ namespace MatrixBG
         Thread worker;
         volatile bool running = false;
         volatile int gen = 0;   // session stamp; written only on the UI thread
+        // (LastError below is volatile for the same reason as ProLink's: worker-thread
+        // writes must be visible to the tray's status reads.)
         Func<int, int, Color> colourSource;   // (bulb index, bulb count) -> colour
 
         public Hue(Settings settings) { s = settings; }
         public bool Paired { get { return s.HueIp.Length > 0 && s.HueUser.Length > 0; } }
         public bool Active { get { return running; } }
-        public string LastError = "";
+        public volatile string LastError = "";
 
         string Url(string path) { return "http://" + s.HueIp + "/api/" + s.HueUser + path; }
 
@@ -1055,7 +1067,7 @@ namespace MatrixBG
         IntPtr handle = IntPtr.Zero;
         volatile bool closing;
         public string OpenPortName = "";
-        public string LastError = "";
+        public volatile string LastError = "";
 
         // Last-value CC overrides (-1 = untouched since enable); single writer (driver thread)
         public volatile int CcSpeed = -1, CcDensity = -1, CcHue = -1, CcBlend = -1, CcTail = -1, CcDim = -1;
@@ -1171,6 +1183,111 @@ namespace MatrixBG
         public void Dispose() { Close(); }
     }
 
+    // ------------------------------------------------------------------ CDJ beat sync (Pro DJ Link, passive)
+    // Pioneer gear broadcasts a beat packet on UDP 50001 for every beat. We only LISTEN:
+    // nothing is ever sent, no device announcement, no internet. The receive thread mirrors
+    // the Midi pattern: primitive fields + an Interlocked beat counter, consumed on the UI
+    // tick. v1 limitation (documented): beats from ANY linked player are accepted; true
+    // tempo-master tracking (port 50002 status) is not implemented, so two decks playing
+    // at once pulse on both phases.
+    class ProLink : IDisposable
+    {
+        static readonly byte[] MAGIC = { 0x51, 0x73, 0x70, 0x74, 0x31, 0x57, 0x6D, 0x4A, 0x4F, 0x4C };
+
+        System.Net.Sockets.UdpClient udp;
+        Thread thread;
+        volatile bool closing;
+        public volatile string LastError = "";
+
+        // written by the receive thread only
+        int beatSeq;
+        public volatile int LastBar = 0;       // beat-within-bar 1..4 (0 = unknown)
+        public volatile int BpmTimes100 = 0;   // pitch-adjusted
+        public volatile int LastDevice = 0;
+        public volatile int LastPacketTick = 0;
+        int lastBeatSeen;                      // UI thread only
+
+        public bool Running { get { return udp != null; } }
+        public bool Hearing { get { return Running && LastPacketTick != 0 && unchecked(Environment.TickCount - LastPacketTick) < 3000; } }
+
+        public bool Open()
+        {
+            Close();
+            try
+            {
+                // Bind order matters: create unbound, set reuse (rekordbox or beat-link on
+                // this machine also bind 50001; Windows shared-UDP delivery is best-effort
+                // and is called out in the README), then bind.
+                System.Net.Sockets.UdpClient u = new System.Net.Sockets.UdpClient(System.Net.Sockets.AddressFamily.InterNetwork);
+                u.ExclusiveAddressUse = false;
+                u.Client.SetSocketOption(System.Net.Sockets.SocketOptionLevel.Socket, System.Net.Sockets.SocketOptionName.ReuseAddress, true);
+                u.Client.Bind(new System.Net.IPEndPoint(System.Net.IPAddress.Any, 50001));
+                udp = u;
+                closing = false;
+                lastBeatSeen = Thread.VolatileRead(ref beatSeq);
+                LastPacketTick = 0;
+                thread = new Thread(delegate() { Run(u); }); thread.IsBackground = true; thread.Start();
+                LastError = "";
+                Program.Log("prolink: listening on udp 50001");
+                return true;
+            }
+            catch (Exception ex) { LastError = ex.Message; udp = null; return false; }
+        }
+
+        public void Close()
+        {
+            closing = true;
+            if (udp != null) { try { udp.Close(); } catch { } udp = null; }
+            if (thread != null && thread.IsAlive) thread.Join(1000);
+            thread = null;
+        }
+
+        void Run(System.Net.Sockets.UdpClient u)
+        {
+            System.Net.IPEndPoint any = new System.Net.IPEndPoint(System.Net.IPAddress.Any, 0);
+            while (!closing)
+            {
+                byte[] d;
+                // Close() surfaces here as SocketException OR ObjectDisposedException; both
+                // are normal shutdown when the closing flag is up. A zombie thread from a
+                // fast Close+Open cycle owns a stale socket (u != udp) and must exit mute,
+                // never publishing its close exception as the NEW listener's error.
+                try { d = u.Receive(ref any); }
+                catch (Exception ex) { if (!closing && ReferenceEquals(u, udp)) { LastError = ex.Message; Program.Log("prolink: " + ex.Message); } break; }
+                if (d == null || d.Length < 0x60 || d[0x0A] != 0x28) continue;   // beat packets only
+                bool ok = true;
+                for (int i = 0; i < MAGIC.Length; i++) if (d[i] != MAGIC[i]) { ok = false; break; }
+                if (!ok) continue;
+
+                int bpm100 = (d[0x5A] << 8) | d[0x5B];                            // BE16, already x100
+                if (bpm100 <= 0 || bpm100 == 0xFFFF) continue;                    // empty deck sentinel
+                long pitch = ((long)d[0x54] << 24) | ((long)d[0x55] << 16) | ((long)d[0x56] << 8) | d[0x57];
+                if (pitch <= 0 || pitch > 0x200000) pitch = 0x100000;             // stopped/garbage -> neutral
+                long eff = (long)bpm100 * pitch / 0x100000;                       // 64-bit, no overflow
+                if (eff < 4000 || eff > 30000) continue;                          // 40..300 BPM sanity
+                int bar = d[0x5C]; if (bar < 1 || bar > 4) bar = 0;
+
+                BpmTimes100 = (int)eff;
+                LastBar = bar;
+                LastDevice = d[0x21];
+                LastPacketTick = Environment.TickCount;
+                Interlocked.Increment(ref beatSeq);
+            }
+        }
+
+        public bool TakeBeat(out int barBeat)
+        {
+            // Sequence first, bar second: the bar value must belong to the beat we accept,
+            // or a downbeat that lands between the two reads reports the previous bar.
+            int b = Thread.VolatileRead(ref beatSeq);
+            if (b != lastBeatSeen) { lastBeatSeen = b; barBeat = LastBar; return true; }
+            barBeat = 0;
+            return false;
+        }
+
+        public void Dispose() { Close(); }
+    }
+
     // ------------------------------------------------------------------ engine: timers, idle/saver logic, pause rules
     class Engine : IDisposable
     {
@@ -1182,6 +1299,7 @@ namespace MatrixBG
         readonly AudioMeter audio = new AudioMeter();
         public readonly Hue Lights;
         public readonly Midi MidiCtl;
+        public readonly ProLink Link;
         public Color RainColour() { return core.CurrentColor(); }
         public Color RainColourFor(int i, int n) { return core.ColourFor(i, n); }
         Color GitLight(int i, int n) { return s.HueColorGit.IsEmpty ? core.ColourFor(i, n) : s.HueColorGit; }
@@ -1210,6 +1328,9 @@ namespace MatrixBG
             MidiCtl = new Midi(s);
             if (s.MidiEnabled && s.MidiPort.Length > 0 && !MidiCtl.Open(s.MidiPort))
                 Program.Log("midi: " + MidiCtl.LastError);
+            Link = new ProLink();
+            if (s.ProLinkEnabled && !Link.Open())
+                Program.Log("prolink: " + Link.LastError);
             Rectangle vs = SystemInformation.VirtualScreen;
             core = new RainCore(Program.WindowMode ? 1280 : vs.Width, Program.WindowMode ? 720 : vs.Height, s);
             if (Program.WindowMode) { test = new TestWindow(core); test.Closed += delegate { Application.Exit(); }; }
@@ -1249,6 +1370,19 @@ namespace MatrixBG
                          || core.MidiBlendT >= 0f || core.MidiTail >= 0f || core.MidiDim >= 0f)
                 {
                     core.MidiSpeedMul = core.MidiDensity = core.MidiHue = core.MidiBlendT = core.MidiTail = core.MidiDim = -1f;
+                }
+
+                // CDJ beat sync. Speed precedence: MIDI CC first, deck BPM second, preset last.
+                if (s.ProLinkEnabled)
+                {
+                    int bar;
+                    if (Link.TakeBeat(out bar))
+                    {
+                        bool down = bar == 1;
+                        if (s.ProLinkPulse == 1 || down) core.BeatPulse = down ? 1f : 0.6f;
+                    }
+                    if (s.ProLinkBpmSync && core.MidiSpeedMul < 0f && Link.Hearing && Link.BpmTimes100 > 0)
+                        core.MidiSpeedMul = Math.Max(0.35f, Math.Min(2.3f, Link.BpmTimes100 / 100f / 120f));
                 }
 
                 if (EffectivelyPaused) return;
@@ -1415,6 +1549,7 @@ namespace MatrixBG
             if (wall != null) wall.Destroy();
             if (test != null) test.Destroy();
             MidiCtl.Dispose();   // first: no late driver callback may publish into a dying engine
+            Link.Dispose();
             Lights.Dispose();
             audio.Dispose();
             core.Dispose();
@@ -1432,6 +1567,7 @@ namespace MatrixBG
         ToolStripMenuItem mIdle, mColor, mMore, mColor2, mBlend, mSpeed, mDensity, mTail, mFlicker, mSize, mChars;
         ToolStripMenuItem mHue, miHueEnabled, miHueBg, miHuePair, mHueLights, miHueTest;
         ToolStripMenuItem mMidi, miMidiEnabled, mMidiPort, miMidiStatus;
+        ToolStripMenuItem mLink, miLinkEnabled, miLinkEvery, miLinkDown, miLinkBpm, miLinkStatus;
 
         // Green family first (all tuned around the classic matrix phosphor), other hues under "More colours".
         static readonly object[,] GREENS = {
@@ -1625,6 +1761,24 @@ namespace MatrixBG
                     "MatrixBG MIDI", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }));
             menu.Items.Add(mMidi);
+
+            // --- CDJ beat sync (Pro DJ Link)
+            mLink = new ToolStripMenuItem("CDJ beat sync (Pro DJ Link)");
+            miLinkEnabled = new ToolStripMenuItem("Enable beat sync (listens on UDP 50001)", null, delegate
+            {
+                s.ProLinkEnabled = !s.ProLinkEnabled;
+                if (s.ProLinkEnabled) engine.Link.Open(); else engine.Link.Close();
+                Changed();
+            });
+            miLinkEvery = new ToolStripMenuItem("Pulse on every beat", null, delegate { s.ProLinkPulse = 1; Changed(); });
+            miLinkDown = new ToolStripMenuItem("Pulse on downbeats only", null, delegate { s.ProLinkPulse = 2; Changed(); });
+            miLinkBpm = new ToolStripMenuItem("Sync rain speed to deck BPM", null, delegate { s.ProLinkBpmSync = !s.ProLinkBpmSync; Changed(); });
+            miLinkStatus = new ToolStripMenuItem(""); miLinkStatus.Enabled = false;
+            ToolStripMenuItem liNote = new ToolStripMenuItem("Passive: hears any linked player (master-only sync not implemented)");
+            liNote.Enabled = false;
+            mLink.DropDownItems.Add(miLinkEnabled); mLink.DropDownItems.Add(miLinkEvery); mLink.DropDownItems.Add(miLinkDown);
+            mLink.DropDownItems.Add(miLinkBpm); mLink.DropDownItems.Add(miLinkStatus); mLink.DropDownItems.Add(liNote);
+            menu.Items.Add(mLink);
             menu.Items.Add(new ToolStripMenuItem("Open settings folder", null, delegate { try { Directory.CreateDirectory(Settings.Dir); Process.Start("explorer.exe", Settings.Dir); } catch { } }));
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(new ToolStripMenuItem("About MatrixBG...", null, delegate { About(); }));
@@ -1693,6 +1847,14 @@ namespace MatrixBG
                 : engine.MidiCtl.OpenPortName.Length > 0 ? "Listening on " + engine.MidiCtl.OpenPortName
                 : engine.MidiCtl.LastError.Length > 0 ? "Error: " + engine.MidiCtl.LastError
                 : "Pick an input port";
+            miLinkEnabled.Checked = s.ProLinkEnabled;
+            miLinkEvery.Checked = s.ProLinkPulse == 1;
+            miLinkDown.Checked = s.ProLinkPulse == 2;
+            miLinkBpm.Checked = s.ProLinkBpmSync;
+            miLinkStatus.Text = !s.ProLinkEnabled ? "CDJ sync off"
+                : !engine.Link.Running ? (engine.Link.LastError.Length > 0 ? "Error: " + engine.Link.LastError : "Not listening")
+                : engine.Link.Hearing ? "Hearing " + (engine.Link.LastDevice >= 33 ? "mixer" : "CDJ #" + engine.Link.LastDevice) + " at " + (engine.Link.BpmTimes100 / 100f).ToString("0.0") + " BPM"
+                : "Listening (no beats yet)";
             mHueLights.Enabled = engine.Lights.Paired; miHueTest.Enabled = engine.Lights.Paired;
             foreach (ToolStripItem it in mIdle.DropDownItems)
             {
